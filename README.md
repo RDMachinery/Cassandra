@@ -2,7 +2,7 @@
 
 > Reads the news, finds the dominant story, and writes a plain-English scenario of what might happen next.
 
-NewsOracle is a small, dependency-free Java program that pulls headlines from RSS feeds, works out which story is dominating the news, measures its tone and momentum, and then describes a plausible chain of consequences over the coming days, weeks and months.
+Miranda is a small, dependency-free Java program that pulls headlines from RSS feeds, works out which story is dominating the news, measures its tone and momentum, and then describes a plausible chain of consequences over the coming days, weeks and months.
 
 It is a **transparent, rule-based heuristic**, not a genuine forecasting engine. See [Limitations](#limitations) before reading anything into its output.
 
