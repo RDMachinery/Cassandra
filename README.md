@@ -1,4 +1,4 @@
-# NewsOracle
+# Miranda
 
 > Reads the news, finds the dominant story, and writes a plain-English scenario of what might happen next.
 
