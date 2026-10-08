@@ -1,10 +1,10 @@
-# Miranda
+# Cassandra 
 
 > A news-driven forecaster that commits to testable predictions, keeps score, and corrects its own overconfidence.
 
-Miranda reads headlines from RSS feeds, finds the dominant story, projects its coverage forward, issues dated and falsifiable predictions with probabilities, and writes a plain-English scenario of what may follow. Every later run grades the predictions that have fallen due, reports a track record, and recalibrates future probabilities accordingly.
+Cassandra reads headlines from RSS feeds, finds the dominant story, projects its coverage forward, issues dated and falsifiable predictions with probabilities, and writes a plain-English scenario of what may follow. Every later run grades the predictions that have fallen due, reports a track record, and recalibrates future probabilities accordingly.
 
-Nobody can see the future, and Miranda doesn't claim to. What she can do is make claims you can check, and tell you honestly how well they have held up. See [Limitations](#limitations).
+Nobody can see the future, and Cassandra doesn't claim to. What she can do is make claims you can check, and tell you honestly how well they have held up. See [Limitations](#limitations).
 
 ## Features
 
@@ -28,35 +28,35 @@ Nobody can see the future, and Miranda doesn't claim to. What she can do is make
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/miranda.git
-cd miranda
+git clone https://github.com/<your-username>/Cassandra.git
+cd Cassandra
 
-javac Miranda.java
-java Miranda
+javac Cassandra.java
+java Cassandra
 ```
 
 Or, without a separate compile step:
 
 ```bash
-java Miranda.java
+java Cassandra.java
 ```
 
 **Run it daily.** Trend fitting needs observations on at least three different days, and predictions are graded 3 and 7 days after they are made. For example, with cron:
 
 ```
-0 8 * * *  cd /path/to/miranda && java Miranda >> miranda.log 2>&1
+0 8 * * *  cd /path/to/cassandra && java Cassandra >> cassandra.log 2>&1
 ```
 
 ## Usage
 
 ```bash
-java Miranda                       # default feeds, state saved in ./miranda-data
-java Miranda URL1 URL2 ...         # your own RSS feeds
-java Miranda --demo                # offline synthetic headlines (state in ./miranda-demo-data)
-java Miranda --data=DIR            # keep history and predictions in DIR
-java Miranda --no-log              # analyse only; read and write nothing
-java Miranda --asof=2026-10-01     # pretend today is this date (demos and backtests only)
-java Miranda --help
+java Cassandra                       # default feeds, state saved in ./cassandra-data
+java Cassandra URL1 URL2 ...         # your own RSS feeds
+java Cassandra  --demo                # offline synthetic headlines (state in ./cassandra-demo-data)
+java Cassandra --data=DIR            # keep history and predictions in DIR
+java Cassandra --no-log              # analyse only; read and write nothing
+java Cassandra --asof=2026-10-01     # pretend today is this date (demos and backtests only)
+java Cassandra --help
 ```
 
 ### Try the learning loop offline
@@ -65,7 +65,7 @@ java Miranda --help
 
 ```bash
 for d in 2026-10-01 2026-10-02 2026-10-03 2026-10-04; do
-  java Miranda --demo --data=/tmp/miranda --asof=$d
+  java Cassandra --demo --data=/tmp/cassandra --asof=$d
 done
 ```
 
@@ -122,11 +122,11 @@ Two plain tab-separated files in the data directory (default `./miranda-data`):
 | `history.tsv` | date, term, rank, article count, total articles, net sentiment |
 | `predictions.tsv` | id, made, due, term, label, kind, param, raw probability, issued probability, outcome, resolved on |
 
-Delete the directory to reset Miranda's memory. Re-running on the same day replaces that day's history rows and never duplicates predictions.
+Delete the directory to reset Cassandra's memory. Re-running on the same day replaces that day's history rows and never duplicates predictions.
 
 ## Customising
 
-Everything lives in `Miranda.java`:
+Everything lives in `Cassandra.java`:
 
 | What to change | Where |
 |---|---|
