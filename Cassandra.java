@@ -33,17 +33,20 @@ import java.util.stream.Collectors;
  *   4. grades every earlier prediction that has now fallen due, reports her track record
  *      (hit rate and Brier score), and uses that record to recalibrate future probabilities.
  *
- * Nobody can see the future. What Miranda can do is commit to testable claims, keep score,
+ * Nobody can see the future. What Cassandra can do is commit to testable claims, keep score,
  * and correct her own over- or under-confidence over time. Run her daily (e.g. via cron) so
  * her history and track record accumulate.
  *
  * Requires Java 16+. No external libraries.
  *
  *
- * Options:  --data=DIR      where history/predictions are kept (default ./miranda-data)
+ * Options:  --demo          offline synthetic headlines (data in ./cassandra-demo-data)
+ *           --data=DIR      where history/predictions are kept (default ./cassandra-data)
  *           --no-log        analyse only; do not read or write any saved state
  *           --asof=DATE     pretend today is DATE (yyyy-mm-dd); for demos and backtests only
  *           --help
+ *
+ * @author Mario Gianota
  */
 public class Cassandra {
 
@@ -187,7 +190,7 @@ public class Cassandra {
     }
 
     static Set<String> stemSet(String words) {
-        return setOf(words).stream().map(Miranda::stem).collect(Collectors.toSet());
+        return setOf(words).stream().map(Cassandra::stem).collect(Collectors.toSet());
     }
 
     // ------------------------------------------------------------------ main
@@ -245,7 +248,7 @@ public class Cassandra {
                 Cassandra - news-driven forecaster
                   java Cassandra [options] [feed-url ...]
                   --demo          offline synthetic headlines (uses ./cassandra-demo-data)
-                  --data=DIR      directory for history.tsv and predictions.tsv (default ./miranda-data)
+                  --data=DIR      directory for history.tsv and predictions.tsv (default ./cassandra-data)
                   --no-log        analyse only; do not read or write saved state
                   --asof=DATE     pretend today is DATE (yyyy-mm-dd); demos and backtests only
                 """);
@@ -259,7 +262,7 @@ public class Cassandra {
                 .connectTimeout(Duration.ofSeconds(10)).build();
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                 .timeout(Duration.ofSeconds(15))
-                .header("User-Agent", "Miranda/1.0 (educational project)")
+                .header("User-Agent", "Cassandra/1.0 (educational project)")
                 .GET().build();
         HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
         if (resp.statusCode() != 200) throw new RuntimeException("HTTP " + resp.statusCode());
@@ -508,7 +511,7 @@ public class Cassandra {
         System.out.println("\nCOVERAGE FORECAST (share of headlines mentioning this story)");
         if (fc == null) {
             System.out.println(wrap("Not enough history yet to fit a trend (need observations on 3+ different days). "
-                    + "Run Miranda daily and this section will fill in.", "  "));
+                    + "Run Cassandra daily and this section will fill in.", "  "));
         } else {
             System.out.println(wrap(String.format(Locale.ROOT,
                     "Trend over %d days of data: %+.1f percentage points per day. Today %.0f%%.",
@@ -701,8 +704,8 @@ public class Cassandra {
         System.out.println(wrap(String.format(Locale.ROOT,
                 "Overall Brier score %.3f over %d graded predictions (a coin-flip forecaster scores 0.250; "
                         + "a perfect one 0.000). %s Pending: %d.", overall, n,
-                overall < 0.25 ? "Miranda is currently beating a coin flip."
-                        : "Miranda is NOT currently beating a coin flip - treat her forecasts accordingly.",
+                overall < 0.25 ? "Cassandra is currently beating a coin flip."
+                        : "Cassandra is NOT currently beating a coin flip - treat her forecasts accordingly.",
                 pending), "  "));
         System.out.println(wrap("Types with " + MIN_FOR_CALIBRATION + "+ graded predictions have their probabilities "
                 + "automatically recalibrated.", "  "));
