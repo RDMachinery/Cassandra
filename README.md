@@ -28,7 +28,7 @@ Nobody can see the future, and Cassandra doesn't claim to. What she can do is ma
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/Cassandra.git
+git clone https://github.com/RDMachinery/Cassandra.git
 cd Cassandra
 
 javac Cassandra.java
