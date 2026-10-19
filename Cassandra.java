@@ -45,8 +45,6 @@ import java.util.stream.Collectors;
  *           --no-log        analyse only; do not read or write any saved state
  *           --asof=DATE     pretend today is DATE (yyyy-mm-dd); for demos and backtests only
  *           --help
- *
- * @author Mario Gianota
  */
 public class Cassandra {
 
@@ -146,7 +144,7 @@ public class Cassandra {
             will would could should their there what when where which while who whom whose why how about after again
             against also because before being between both did does doing down during each few further here into
             just more most other over own same some such than then these those through under until very were your
-            says said say new news year years day days week weeks today latest live first last may might must now
+            says said say continue new news year years day days week weeks today latest live first last may might must now
             people one two three still back off get gets got take takes make makes made see seen like told way
             report reports reported video watch analysis opinion editorial per cent amid among set uk us
             bbc guardian its his him she he we me my is it in on at to of a an as be by do if or so no go am""");
@@ -289,8 +287,13 @@ public class Cassandra {
         return nl.getLength() == 0 ? "" : nl.item(0).getTextContent();
     }
 
+    /** Feed boilerplate such as "Continue reading..." that would otherwise swamp the real headlines. */
+    static final String BOILERPLATE = "(?i)\\b(continue|keep)\\s+reading\\b[.\\u2026\\s]*"
+            + "|(?i)\\bread\\s+(more|the full (story|article))\\b[.\\u2026\\s]*";
+
     static String clean(String s) {
-        return s.replaceAll("<[^>]*>", " ").replaceAll("&[a-z#0-9]+;", " ").replaceAll("\\s+", " ").trim();
+        return s.replaceAll("<[^>]*>", " ").replaceAll("&[a-z#0-9]+;", " ")
+                .replaceAll(BOILERPLATE, " ").replaceAll("\\s+", " ").trim();
     }
 
     static Instant parseDate(String s) {
