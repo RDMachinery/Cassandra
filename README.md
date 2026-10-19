@@ -115,7 +115,7 @@ MIRANDA'S TRACK RECORD
 
 ## Saved state
 
-Two plain tab-separated files in the data directory (default `./miranda-data`):
+Two plain tab-separated files in the data directory (default `./cassandra-data`):
 
 | File | Columns |
 |---|---|
