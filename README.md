@@ -1,3 +1,4 @@
+![Cassandra](splash.jpg)
 # Cassandra 
 
 > A news-driven forecaster that commits to testable predictions, keeps score, and corrects its own overconfidence.
