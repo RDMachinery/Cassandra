@@ -55,7 +55,7 @@ Existing `history.tsv` and `predictions.tsv` files work unchanged.
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/Cassandra.git
+git clone https://github.com/RDMachinery/Cassandra.git
 cd Cassandra
 
 javac Cassandra.java
