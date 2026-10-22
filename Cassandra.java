@@ -26,9 +26,9 @@ import java.util.stream.Collectors;
 /**
  * Cassandra - a news-driven forecaster.
  *
- * Each run, Cassandra reads headlines from RSS feeds, finds the dominant story, and then:
- *   1. fits a trend to that story's share of coverage over past runs and projects it forward;
- *   2. issues explicit, dated, falsifiable predictions with probabilities;
+ * Each run, Cassandra reads headlines from RSS feeds, finds the leading stories, and then:
+ *   1. fits a trend to each story's share of coverage since it first appeared and projects it forward;
+ *   2. issues explicit, dated, falsifiable predictions with probabilities for the top 3 stories;
  *   3. writes a plain-English scenario of the likely consequences;
  *   4. grades every earlier prediction that has now fallen due, reports her track record
  *      (hit rate and Brier score), and uses that record to recalibrate future probabilities.
@@ -63,6 +63,9 @@ public class Cassandra {
     static final int HISTORY_DAYS = 14;        // how far back the trend fit looks
     static final int MIN_FOR_CALIBRATION = 5;  // resolved predictions needed before recalibrating
     static final int GRACE_DAYS = 2;           // a prediction not graded within this window is void
+    static final int PREDICTED_STORIES = 3;    // how many of the leading stories get predictions
+    static final double RANK_PENALTY = 0.07;   // TOP5 prior is lowered by this much per rank below #1
+    static final LocalDate DEMO_START = LocalDate.of(2026, 10, 1); // day 0 of the demo storyline
 
     static Instant NOW = Instant.now();
     static LocalDate TODAY = LocalDate.now(ZoneOffset.UTC);
@@ -102,6 +105,14 @@ public class Cassandra {
             return sd * Math.sqrt(1 + 1.0 / n + d * d / sxx);
         }
     }
+
+    /**
+     * One of today's leading stories, fully measured.
+     * firstSeen: earliest earlier run (within the look-back window) on which the story was in the top 10,
+     * or null if it is new today. points: number of daily observations the trend fit can use.
+     */
+    record Story(int rank, String term, List<Doc> docs, String label, double net, Tone tone,
+                 String momentum, double share, LocalDate firstSeen, int points, Forecast fc) {}
 
     /** Today's picture of the news, used both to make and to grade predictions. */
     static class Snapshot {
@@ -447,24 +458,12 @@ public class Cassandra {
                 .map(Map.Entry::getKey).toList();
         List<String> reps = storyReps(ranked, index, 10);
 
-        String topTerm = reps.get(0);
-        List<Doc> story = index.get(topTerm);
         Snapshot snap = new Snapshot(index, reps, docs.size());
-
-        String label = bestPhrase(topTerm, story);
-        List<String> related = relatedTerms(topTerm, story, 8).stream()
-                .filter(w -> !label.contains(w)).limit(3).toList();
-
-        long sources = story.stream().map(d -> d.article().source()).distinct().count();
-        double net = story.stream().mapToInt(Cassandra::netSentiment).average().orElse(0);
-        Tone tone = net <= -0.5 ? Tone.NEGATIVE : net >= 0.5 ? Tone.POSITIVE : Tone.MIXED;
-        String momentum = momentum(story);
-        Domain domain = classify(story);
-        double shareNow = snap.share(topTerm);
 
         // 2. Saved state: history and predictions
         List<HistRow> history = log ? loadHistory(dir) : new ArrayList<>();
         List<Pred> preds = log ? loadPreds(dir) : new ArrayList<>();
+        boolean anyPriorRuns = history.stream().anyMatch(r -> r.date().isBefore(TODAY));
 
         // 3. Grade anything that has fallen due
         List<Pred> gradedNow = new ArrayList<>();
@@ -479,11 +478,28 @@ public class Cassandra {
         }
         Map<String, Stat> record = trackRecord(preds);
 
-        // 4. Trend fit on this story's share of coverage
-        Forecast fc = forecast(history, topTerm, shareNow);
+        // 4. Measure the leading stories, including a trend fit for each
+        List<Story> top = new ArrayList<>();
+        for (int i = 0; i < Math.min(PREDICTED_STORIES, reps.size()); i++)
+            top.add(describe(i + 1, reps.get(i), snap, history));
 
-        // 5. Issue new predictions
-        List<Pred> fresh = makePredictions(topTerm, label, tone, net, momentum, shareNow, history, fc, record);
+        Story lead = top.get(0);
+        String topTerm = lead.term();
+        List<Doc> story = lead.docs();
+        String label = lead.label();
+        double net = lead.net();
+        Tone tone = lead.tone();
+        String momentum = lead.momentum();
+        double shareNow = lead.share();
+        Forecast fc = lead.fc();
+        List<String> related = relatedTerms(topTerm, story, 8).stream()
+                .filter(w -> !label.contains(w)).limit(3).toList();
+        long sources = story.stream().map(d -> d.article().source()).distinct().count();
+        Domain domain = classify(story);
+
+        // 5. Issue new predictions for each leading story
+        List<Pred> fresh = new ArrayList<>();
+        for (Story s : top) fresh.addAll(makePredictions(s, history, record));
         Set<String> known = preds.stream().map(Pred::id).collect(Collectors.toSet());
         List<Pred> toAdd = fresh.stream().filter(p -> !known.contains(p.id())).toList();
         if (log) {
@@ -513,12 +529,22 @@ public class Cassandra {
         // coverage forecast
         System.out.println("\nCOVERAGE FORECAST (share of headlines mentioning this story)");
         if (fc == null) {
-            System.out.println(wrap("Not enough history yet to fit a trend (need observations on 3+ different days). "
-                    + "Run Cassandra daily and this section will fill in.", "  "));
+            String why;
+            if (!anyPriorRuns)
+                why = "Not enough history yet to fit a trend (need observations on 3+ different days). "
+                        + "Run Cassandra daily and this section will fill in.";
+            else if (lead.firstSeen() == null)
+                why = "New story: it was not in the top 10 on any earlier run, so there is no trend to fit yet. "
+                        + "A trend needs 3+ days of data from the day a story first appears; until then the "
+                        + "SHARE_UP forecast falls back on today's momentum.";
+            else
+                why = String.format(Locale.ROOT, "Young story: first in the top 10 on %s, which gives %d day(s) "
+                        + "of data including today. A trend needs 3.", lead.firstSeen(), lead.points());
+            System.out.println(wrap(why, "  "));
         } else {
             System.out.println(wrap(String.format(Locale.ROOT,
-                    "Trend over %d days of data: %+.1f percentage points per day. Today %.0f%%.",
-                    fc.n(), fc.slope() * 100, shareNow * 100), "  "));
+                    "Trend over %d days of data (since %s): %+.1f percentage points per day. Today %.0f%%.",
+                    fc.n(), lead.firstSeen(), fc.slope() * 100, shareNow * 100), "  "));
             for (int h : new int[]{3, 7}) {
                 double mid = clamp(fc.at(h), 0, 1), w = 1.2816 * fc.predSd(h);
                 System.out.println(String.format(Locale.ROOT, "  In %d days: about %.0f%% (80%% range %.0f%%-%.0f%%)",
@@ -527,9 +553,16 @@ public class Cassandra {
         }
 
         // predictions
-        System.out.println("\nPREDICTIONS (logged and graded when due)");
-        for (Pred p : fresh) System.out.println(wrap("- " + statement(p) + "  -> "
-                + pct(p.p()) + (p.p() != p.pRaw() ? " [recalibrated from " + pct(p.pRaw()) + "]" : ""), "  "));
+        System.out.println("\nPREDICTIONS FOR THE TOP " + top.size() + (top.size() == 1 ? " STORY" : " STORIES")
+                + " (logged and graded when due)");
+        for (Story s : top) {
+            System.out.println(String.format(Locale.ROOT, "  %d. \"%s\" - %.0f%% of coverage%s", s.rank(), s.label(),
+                    s.share() * 100, anyPriorRuns && s.firstSeen() == null ? ", new today" : ""));
+            for (Pred p : fresh)
+                if (p.term().equals(s.term()))
+                    System.out.println(wrap("- " + statement(p) + "  -> " + pct(p.p())
+                            + (p.p() != p.pRaw() ? " [recalibrated from " + pct(p.pRaw()) + "]" : ""), "     ", "       "));
+        }
         if (!log) System.out.println("  (--no-log: these were not saved and cannot be graded later)");
         else if (toAdd.isEmpty()) System.out.println("  (already logged earlier today)");
 
@@ -577,10 +610,23 @@ public class Cassandra {
 
     // ------------------------------------------------------------------ predictions
 
-    static List<Pred> makePredictions(String term, String label, Tone tone, double net, String momentum,
-                                      double shareNow, List<HistRow> history, Forecast fc,
-                                      Map<String, Stat> record) {
+    /** Measure one of today's leading stories: label, tone, momentum, share and trend. */
+    static Story describe(int rank, String term, Snapshot snap, List<HistRow> history) {
+        List<Doc> ds = snap.index.get(term);
+        double net = ds.stream().mapToInt(Cassandra::netSentiment).average().orElse(0);
+        Tone tone = net <= -0.5 ? Tone.NEGATIVE : net >= 0.5 ? Tone.POSITIVE : Tone.MIXED;
+        double share = snap.share(term);
+        List<double[]> pts = trendPoints(history, term, share);
+        return new Story(rank, term, ds, bestPhrase(term, ds), net, tone, momentum(ds), share,
+                firstSeen(history, term), pts.size(), fit(pts));
+    }
+
+    static List<Pred> makePredictions(Story s, List<HistRow> history, Map<String, Stat> record) {
         List<Pred> out = new ArrayList<>();
+        String term = s.term(), label = s.label(), momentum = s.momentum();
+        Tone tone = s.tone();
+        double net = s.net(), shareNow = s.share();
+        Forecast fc = s.fc();
 
         // persistence: how many consecutive earlier days was this story already in the top 5?
         int streak = 0;
@@ -591,7 +637,8 @@ public class Cassandra {
             if (in) streak++; else break;
         }
         double mom = momentum.equals("accelerating") ? 0.10 : momentum.equals("fading") ? -0.15 : 0;
-        double top3 = clamp(0.62 + 0.05 * Math.min(streak, 5) + mom, 0.10, 0.92);
+        // lower-ranked stories are less secure in the top 5, so their prior starts lower
+        double top3 = clamp(0.62 - RANK_PENALTY * (s.rank() - 1) + 0.05 * Math.min(streak, 5) + mom, 0.10, 0.92);
         double top7 = clamp(top3 - 0.15, 0.10, 0.92);
 
         out.add(pred(term, label, "TOP5", 3, "-", top3, record));
@@ -716,19 +763,38 @@ public class Cassandra {
 
     // ------------------------------------------------------------------ trend model
 
-    /** Least-squares line through this story's share of coverage on past run dates plus today. */
-    static Forecast forecast(List<HistRow> history, String term, double shareNow) {
+    /** Earliest earlier run within the look-back window on which this story was in the top 10, or null. */
+    static LocalDate firstSeen(List<HistRow> history, String term) {
         LocalDate from = TODAY.minusDays(HISTORY_DAYS);
-        List<LocalDate> dates = history.stream().map(HistRow::date)
-                .filter(d -> d.isBefore(TODAY) && !d.isBefore(from)).distinct().sorted().toList();
+        return history.stream()
+                .filter(r -> r.term().equals(term) && r.date().isBefore(TODAY) && !r.date().isBefore(from))
+                .map(HistRow::date).min(Comparator.naturalOrder()).orElse(null);
+    }
+
+    /**
+     * Daily (days-from-today, share) observations for the trend fit, starting from the day the story first
+     * appeared. Earlier days are left out: counting them as zero would make every new story look like a
+     * steep riser. After it first appears, a day it drops out of the top 10 still counts as a negligible
+     * share, because that drop is real.
+     */
+    static List<double[]> trendPoints(List<HistRow> history, String term, double shareNow) {
         List<double[]> pts = new ArrayList<>();
-        for (LocalDate d : dates) {
-            Optional<HistRow> row = history.stream()
-                    .filter(r -> r.date().equals(d) && r.term().equals(term)).findFirst();
-            // a story absent from a day's top 10 is treated as having a negligible share
-            pts.add(new double[]{ChronoUnit.DAYS.between(TODAY, d), row.map(HistRow::share).orElse(0.0)});
+        LocalDate first = firstSeen(history, term);
+        if (first != null) {
+            List<LocalDate> dates = history.stream().map(HistRow::date)
+                    .filter(d -> d.isBefore(TODAY) && !d.isBefore(first)).distinct().sorted().toList();
+            for (LocalDate d : dates) {
+                Optional<HistRow> row = history.stream()
+                        .filter(r -> r.date().equals(d) && r.term().equals(term)).findFirst();
+                pts.add(new double[]{ChronoUnit.DAYS.between(TODAY, d), row.map(HistRow::share).orElse(0.0)});
+            }
         }
         pts.add(new double[]{0, shareNow});
+        return pts;
+    }
+
+    /** Least-squares line through the trend points, or null with fewer than 3 days of data. */
+    static Forecast fit(List<double[]> pts) {
         int n = pts.size();
         if (n < 3) return null;
 
@@ -909,12 +975,17 @@ public class Cassandra {
         return String.join(", ", items.subList(0, items.size() - 1)) + " and " + items.get(items.size() - 1);
     }
 
-    static String wrap(String text, String indent) {
+    static String wrap(String text, String indent) { return wrap(text, indent, indent); }
+
+    /** Word-wrap to WRAP columns, with one indent for the first line and another for continuation lines. */
+    static String wrap(String text, String first, String rest) {
         StringBuilder out = new StringBuilder();
+        String indent = first;
         StringBuilder line = new StringBuilder(indent);
         for (String word : text.split(" ")) {
             if (line.length() + word.length() + 1 > WRAP && line.length() > indent.length()) {
-                out.append(line).append('\n');
+                out.append(line.toString().stripTrailing()).append('\n');
+                indent = rest;
                 line = new StringBuilder(indent);
             }
             if (line.length() > indent.length()) line.append(' ');
@@ -925,23 +996,58 @@ public class Cassandra {
 
     // ------------------------------------------------------------------ demo data
 
+    // Each row: source, title, body, hours before NOW.
+    static final String[][] DEMO_PORT = {
+            {"demo-wire-a", "Port strike halts shipping as talks collapse", "Dockworkers walked out; supply chain delays warned across retailers", "1"},
+            {"demo-wire-a", "Retailers warn of shortages as port strike enters second day", "Shipping firms reroute cargo, prices expected to rise", "2"},
+            {"demo-wire-b", "Port strike threatens holiday supply, business groups say", "Business leaders fear damage to growth as shipping stalls", "2"},
+            {"demo-wire-b", "Union rejects offer as port strike deepens", "Talks collapse again; shipping delays spread", "3"},
+            {"demo-wire-c", "Markets slide as port strike hits shipping stocks", "Shares fall, analysts warn of inflation risk from supply delays", "3"},
+            {"demo-wire-c", "Government urged to intervene in port strike", "Ministers face pressure as shortages loom and prices rise", "4"},
+            {"demo-wire-a", "Port strike: what it means for prices", "Economists warn of a hit to growth if shipping delays continue", "5"},
+            {"demo-wire-b", "Port strike talks resume under mediator", "Union and employers meet as shipping backlog grows", "6"},
+            {"demo-wire-c", "Supermarkets ration goods as port strike drags on", "Shortages spread to fresh produce as shipping delays persist", "7"},
+            {"demo-wire-a", "Port strike costs economy millions a day", "Business groups warn of lasting damage to trade", "10"}};
+
+    static final String[][] DEMO_CHIP = {
+            {"demo-wire-b", "Chipmaker unveils new AI processor", "Launch boosts investor hope in the chip sector", "9"},
+            {"demo-wire-c", "Rivals race to match AI chip launch", "Chip designers promise faster processors next year", "5"},
+            {"demo-wire-a", "AI chip demand lifts tech stocks", "Investors cheer record orders for the new processor", "4"},
+            {"demo-wire-b", "Regulators review AI chip export rules", "Officials weigh security concerns over processor sales", "11"},
+            {"demo-wire-c", "Cloud firms sign deals for AI chip capacity", "Data centre operators agree multi-year processor orders", "2"}};
+
+    static final String[][] DEMO_STORM = {
+            {"demo-wire-a", "Storm warnings issued as heavy rain sweeps north", "Forecasters warn of flooding and high winds", "1"},
+            {"demo-wire-b", "Flood alerts in place as storm brings travel chaos", "Roads closed and trains cancelled across the region", "2"},
+            {"demo-wire-c", "Storm damage leaves thousands without power", "Engineers work overnight to restore electricity", "3"},
+            {"demo-wire-a", "Rail services suspended as storm batters coast", "Operators urge passengers not to travel", "5"},
+            {"demo-wire-b", "Councils open rest centres as storm floods homes", "Residents evacuated as river levels rise", "6"},
+            {"demo-wire-c", "Insurers brace for storm claims", "Damage estimates climb as the clean-up begins", "8"}};
+
+    static final String[][] DEMO_FILLER = {
+            {"demo-wire-c", "Council approves new cycling scheme", "Residents welcome plan", "12"},
+            {"demo-wire-a", "Local team wins cup final", "Fans celebrate record crowd", "14"},
+            {"demo-wire-b", "Museum reopens after restoration", "Visitors praise restored gallery", "16"}};
+
+    /**
+     * Synthetic headlines that change from day to day, so --demo with --asof shows a storyline: a port
+     * strike that slowly fades, a steady AI chip story, and a storm that breaks on day 2 and grows.
+     * The mix is random but reproducible: the same date always gives the same headlines.
+     */
     static List<Article> demoArticles() {
-        Instant n = NOW;
-        String[][] rows = {
-                {"demo-wire-a", "Port strike halts shipping as talks collapse", "Dockworkers walked out; supply chain delays warned across retailers", "1"},
-                {"demo-wire-a", "Retailers warn of shortages as port strike enters second day", "Shipping firms reroute cargo, prices expected to rise", "2"},
-                {"demo-wire-b", "Port strike threatens holiday supply, business groups say", "Business leaders fear damage to growth as shipping stalls", "2"},
-                {"demo-wire-b", "Union rejects offer as port strike deepens", "Talks collapse again; shipping delays spread", "3"},
-                {"demo-wire-c", "Markets slide as port strike hits shipping stocks", "Shares fall, analysts warn of inflation risk from supply delays", "3"},
-                {"demo-wire-c", "Government urged to intervene in port strike", "Ministers face pressure as shortages loom and prices rise", "4"},
-                {"demo-wire-a", "Port strike: what it means for prices", "Economists warn of a hit to growth if shipping delays continue", "5"},
-                {"demo-wire-b", "Chipmaker unveils new AI processor", "Launch boosts investor hope", "9"},
-                {"demo-wire-c", "Council approves new cycling scheme", "Residents welcome plan", "12"},
-                {"demo-wire-a", "Local team wins cup final", "Fans celebrate record crowd", "14"}
-        };
+        int day = Math.floorMod(ChronoUnit.DAYS.between(DEMO_START, TODAY), 14);
+        Random rnd = new Random(TODAY.toEpochDay());
         List<Article> out = new ArrayList<>();
-        for (String[] r : rows)
-            out.add(new Article(r[0], r[1], r[2], n.minus(Duration.ofHours(Long.parseLong(r[3])))));
+        addDemo(out, DEMO_PORT, Math.max(0.35, 0.95 - 0.07 * day), rnd);
+        addDemo(out, DEMO_CHIP, 0.75, rnd);
+        addDemo(out, DEMO_STORM, day < 2 ? 0 : Math.min(0.95, 0.55 + 0.15 * (day - 2)), rnd);
+        addDemo(out, DEMO_FILLER, 1.0, rnd);
         return out;
+    }
+
+    static void addDemo(List<Article> out, String[][] rows, double p, Random rnd) {
+        for (String[] r : rows)
+            if (rnd.nextDouble() < p)
+                out.add(new Article(r[0], r[1], r[2], NOW.minus(Duration.ofHours(Long.parseLong(r[3])))));
     }
 }
