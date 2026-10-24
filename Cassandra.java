@@ -44,6 +44,8 @@ import java.util.stream.Collectors;
  *           --data=DIR      where history/predictions are kept (default ./cassandra-data)
  *           --no-log        analyse only; do not read or write any saved state
  *           --asof=DATE     pretend today is DATE (yyyy-mm-dd); for demos and backtests only
+ *           --report        accuracy report from saved predictions: skill against a base-rate forecaster,
+ *                           reliability table and weekly Brier scores. Fetches nothing.
  *           --help
  */
 public class Cassandra {
@@ -207,11 +209,12 @@ public class Cassandra {
     public static void main(String[] args) throws IOException {
         boolean demo = false, log = true;
         String dataArg = null;
-        boolean asof = false;
+        boolean asof = false, accuracy = false;
         List<String> feeds = new ArrayList<>();
 
         for (String a : args) {
             if (a.equals("--demo")) demo = true;
+            else if (a.equals("--report")) accuracy = true;
             else if (a.equals("--no-log")) log = false;
             else if (a.startsWith("--data=")) dataArg = a.substring(7);
             else if (a.startsWith("--asof=")) {
@@ -225,6 +228,7 @@ public class Cassandra {
             System.out.println("Warning: --asof is meant for --demo/backtests; live headlines are dated in real time.\n");
 
         Path dir = Paths.get(dataArg != null ? dataArg : demo ? "cassandra-demo-data" : "cassandra-data");
+        if (accuracy) { accuracyReport(dir); return; }
         List<Article> articles = new ArrayList<>();
 
         if (demo) {
@@ -260,6 +264,7 @@ public class Cassandra {
                   --data=DIR      directory for history.tsv and predictions.tsv (default ./cassandra-data)
                   --no-log        analyse only; do not read or write saved state
                   --asof=DATE     pretend today is DATE (yyyy-mm-dd); demos and backtests only
+                  --report        print an accuracy report from saved predictions (no feeds are fetched)
                 """);
     }
 
@@ -757,8 +762,234 @@ public class Cassandra {
                 overall < 0.25 ? "Cassandra is currently beating a coin flip."
                         : "Cassandra is NOT currently beating a coin flip - treat her forecasts accordingly.",
                 pending), "  "));
+        List<Pred> graded = preds.stream().filter(Pred::graded).toList();
+        Map<String, Double> base = baseRates(graded);
+        List<Pred> comp = graded.stream().filter(p -> base.containsKey(p.id())).toList();
+        double ref = brier(comp, p -> base.get(p.id()));
+        if (comp.size() >= MIN_FOR_VERDICT && ref > 0)
+            System.out.println(wrap(String.format(Locale.ROOT, "Skill against a base-rate forecaster: %+.2f over %d "
+                    + "comparable predictions (above 0 means she adds something beyond \"what usually happens\"). "
+                    + "Run with --report for the full picture.", 1 - brier(comp, Pred::p) / ref, comp.size()), "  "));
+        else
+            System.out.println(wrap("Too early to compare her with a base-rate forecaster (" + comp.size() + " of "
+                    + MIN_FOR_VERDICT + " comparable predictions). Run with --report for details.", "  "));
         System.out.println(wrap("Types with " + MIN_FOR_CALIBRATION + "+ graded predictions have their probabilities "
                 + "automatically recalibrated.", "  "));
+    }
+
+    // ------------------------------------------------------------------ accuracy report (--report)
+
+    static final int BOOTSTRAP = 2000;     // resamples for the skill-score interval
+    static final int BASE_WARMUP = 5;      // earlier results of a type the base-rate forecaster needs
+    static final int MIN_FOR_VERDICT = 30; // comparable predictions needed before --report gives a verdict
+
+    static double outcome(Pred p) { return p.outcome().equals("TRUE") ? 1 : 0; }
+
+    static LocalDate resolvedOn(Pred p) {
+        try { return LocalDate.parse(p.resolved()); } catch (RuntimeException e) { return p.due(); }
+    }
+
+    static double brier(List<Pred> ps, java.util.function.ToDoubleFunction<Pred> forecast) {
+        if (ps.isEmpty()) return Double.NaN;
+        double s = 0;
+        for (Pred p : ps) { double d = forecast.applyAsDouble(p) - outcome(p); s += d * d; }
+        return s / ps.size();
+    }
+
+    /**
+     * The benchmark forecaster: for each prediction it forecasts how often claims of the same type
+     * (kind and horizon) had come true among those already graded when the prediction was made.
+     * It only uses information that existed at the time, so it is a fair, beatable opponent.
+     * Predictions made before BASE_WARMUP results of their type were known are left out of the map:
+     * a benchmark with no history would just say 50%, and beating that proves nothing.
+     */
+    static Map<String, Double> baseRates(List<Pred> graded) {
+        Map<String, Double> out = new HashMap<>();
+        for (Pred p : graded) {
+            int n = 0, hits = 0;
+            for (Pred q : graded)
+                if (q.key().equals(p.key()) && q != p && !resolvedOn(q).isAfter(p.made())) {
+                    n++;
+                    hits += (int) outcome(q);
+                }
+            if (n >= BASE_WARMUP) out.put(p.id(), (hits + 0.5) / (n + 1.0));
+        }
+        return out;
+    }
+
+    /**
+     * 90% bootstrap interval for the skill score 1 - B(Cassandra) / B(base rate).
+     * Whole days are resampled rather than single predictions: predictions made on the same day are
+     * about the same stories and tend to succeed or fail together, and treating them as independent
+     * would make the interval look narrower than it really is.
+     */
+    static double[] skillInterval(List<Pred> graded, Map<String, Double> base) {
+        Map<LocalDate, double[]> byDay = new TreeMap<>(); // made date -> {sum Brier Cassandra, sum Brier base}
+        for (Pred p : graded) {
+            double[] s = byDay.computeIfAbsent(p.made(), k -> new double[2]);
+            s[0] += Math.pow(p.p() - outcome(p), 2);
+            s[1] += Math.pow(base.get(p.id()) - outcome(p), 2);
+        }
+        List<double[]> days = new ArrayList<>(byDay.values());
+        int n = days.size();
+        Random rnd = new Random(42);
+        double[] skills = new double[BOOTSTRAP];
+        for (int k = 0; k < BOOTSTRAP; k++) {
+            double sb = 0, sr = 0;
+            for (int i = 0; i < n; i++) { double[] d = days.get(rnd.nextInt(n)); sb += d[0]; sr += d[1]; }
+            skills[k] = sr == 0 ? 0 : 1 - sb / sr;
+        }
+        Arrays.sort(skills);
+        return new double[]{skills[(int) (0.05 * BOOTSTRAP)], skills[(int) (0.95 * BOOTSTRAP) - 1]};
+    }
+
+    static String num(double v, String fmt) { return Double.isNaN(v) ? "n/a" : String.format(Locale.ROOT, fmt, v); }
+
+    static void accuracyReport(Path dir) {
+        String bar = "=".repeat(WRAP);
+        if (!Files.exists(dir.resolve("predictions.tsv"))) {
+            System.out.println("No predictions found in " + dir.toAbsolutePath() + ". Run Cassandra a few times first "
+                    + "(or pass --data=DIR / --demo to point at another data directory).");
+            return;
+        }
+        List<Pred> preds = loadPreds(dir);
+        List<Pred> graded = preds.stream().filter(Pred::graded)
+                .sorted(Comparator.comparing(Cassandra::resolvedOn).thenComparing(Pred::id)).toList();
+        long pending = preds.stream().filter(p -> p.outcome().equals("PENDING")).count();
+        long voided = preds.stream().filter(p -> p.outcome().equals("VOID")).count();
+
+        System.out.println(bar);
+        System.out.println(" CASSANDRA - accuracy report");
+        System.out.println(bar);
+        System.out.println(wrap(String.format(Locale.ROOT, "Data: %s. %d predictions logged: %d graded, %d pending, "
+                + "%d void (could not be graded, excluded from all scores).",
+                dir, preds.size(), graded.size(), pending, voided), ""));
+        if (graded.isEmpty()) {
+            System.out.println("\nNothing has been graded yet, so there is nothing to score. Predictions fall due 3 and "
+                    + "7 days after they are made.");
+            return;
+        }
+        System.out.println("Graded predictions were resolved between " + resolvedOn(graded.get(0)) + " and "
+                + resolvedOn(graded.get(graded.size() - 1)) + ".");
+
+        Map<String, Double> base = baseRates(graded);
+        List<Pred> comp = graded.stream().filter(p -> base.containsKey(p.id())).toList();
+        double bCass = brier(graded, Pred::p), bRaw = brier(graded, Pred::pRaw), bCoin = brier(graded, p -> 0.5);
+        double cCass = brier(comp, Pred::p), cBase = brier(comp, p -> base.get(p.id()));
+        double skill = comp.isEmpty() || cBase == 0 ? Double.NaN : 1 - cCass / cBase;
+
+        // ---- headline
+        System.out.println("\nTHE SHORT ANSWER");
+        if (comp.size() < MIN_FOR_VERDICT) {
+            System.out.println(wrap(String.format(Locale.ROOT, "Too early to judge. Only %d prediction(s) can be "
+                    + "compared with the base-rate forecaster so far; a verdict needs %d. (The benchmark needs %d "
+                    + "earlier results of a type before it can make a forecast, so the first few of each type are "
+                    + "skipped.)%s", comp.size(), MIN_FOR_VERDICT, BASE_WARMUP,
+                    comp.isEmpty() ? "" : " Provisional skill score: " + num(skill, "%+.2f") + "."), "  "));
+        } else {
+            double[] ci = skillInterval(comp, base);
+            String verdict;
+            if (ci[0] > 0)
+                verdict = "Cassandra is beating the base-rate forecaster, by more than luck alone would easily "
+                        + "explain: her probabilities carry information beyond \"what usually happens\".";
+            else if (ci[1] < 0)
+                verdict = "Cassandra is doing WORSE than simply forecasting how often each type of claim usually "
+                        + "comes true. Treat her probabilities with suspicion.";
+            else
+                verdict = "Cassandra cannot yet be told apart from the base-rate forecaster: any edge she has is "
+                        + "within the range that luck alone could produce.";
+            System.out.println(wrap(verdict, "  "));
+            System.out.println(wrap(String.format(Locale.ROOT, "Skill score %s over %d comparable predictions "
+                    + "(90%% interval %+.2f to %+.2f). 0 means no better than the base rate, 1 would be perfect, "
+                    + "below 0 is worse.", num(skill, "%+.2f"), comp.size(), ci[0], ci[1]), "  "));
+        }
+
+        // ---- scores against benchmarks
+        System.out.println("\nBRIER SCORES (lower is better; 0 is perfect)");
+        System.out.println("  All " + graded.size() + " graded predictions:");
+        System.out.println(String.format(Locale.ROOT, "    Cassandra (issued probabilities)    %.3f", bCass));
+        System.out.println(String.format(Locale.ROOT, "    Cassandra before recalibration      %.3f", bRaw));
+        System.out.println(String.format(Locale.ROOT, "    Coin flip (always 50%%)              %.3f", bCoin));
+        if (!comp.isEmpty()) {
+            System.out.println("  The " + comp.size() + " predictions the base-rate forecaster could also make:");
+            System.out.println(String.format(Locale.ROOT, "    Cassandra                           %.3f", cCass));
+            System.out.println(String.format(Locale.ROOT, "    Base-rate forecaster                %.3f", cBase));
+        }
+        long recal = graded.stream().filter(p -> Math.abs(p.p() - p.pRaw()) > 1e-9).count();
+        if (recal == 0)
+            System.out.println(wrap("No graded prediction has been recalibrated yet, so the first two lines are the same.", "  "));
+        else
+            System.out.println(wrap(String.format(Locale.ROOT, "Recalibration changed %d of the %d graded predictions "
+                    + "and %s her score (%.3f -> %.3f).", recal, graded.size(),
+                    bCass < bRaw ? "improved" : bCass > bRaw ? "worsened" : "did not change", bRaw, bCass), "  "));
+
+        // ---- by type
+        System.out.println("\nBY PREDICTION TYPE");
+        System.out.println("  type             graded  came true  avg forecast   Brier   skill vs base rate");
+        Map<String, List<Pred>> byType = new TreeMap<>();
+        for (Pred p : graded) byType.computeIfAbsent(p.key(), k -> new ArrayList<>()).add(p);
+        for (var e : byType.entrySet()) {
+            List<Pred> ps = e.getValue();
+            List<Pred> cs = ps.stream().filter(p -> base.containsKey(p.id())).toList();
+            double cb = brier(cs, Pred::p), cr = brier(cs, p -> base.get(p.id()));
+            String sk = cs.isEmpty() || cr == 0 ? "n/a"
+                    : String.format(Locale.ROOT, "%+.2f (on %d)", 1 - cb / cr, cs.size());
+            System.out.println(String.format(Locale.ROOT, "  %-16s %6d  %8.0f%%  %11.0f%%   %.3f   %s",
+                    e.getKey(), ps.size(), 100 * ps.stream().mapToDouble(Cassandra::outcome).average().orElse(0),
+                    100 * ps.stream().mapToDouble(Pred::p).average().orElse(0), brier(ps, Pred::p), sk));
+        }
+        System.out.println(wrap("A type that comes true almost every time is easy to score well on; the skill column "
+                + "shows whether Cassandra does better than simply knowing that.", "  "));
+
+        // ---- reliability
+        System.out.println("\nRELIABILITY (when she says X%, does it happen X% of the time?)");
+        System.out.println("  forecast  graded  avg forecast  came true  verdict");
+        for (int k = 0; k < 5; k++) {
+            double lo = k * 0.2, hi = lo + 0.2;
+            int kk = k;
+            List<Pred> bin = graded.stream().filter(p -> {
+                int b = Math.min(4, (int) (p.p() * 5));
+                return b == kk;
+            }).toList();
+            String range = String.format(Locale.ROOT, "%-8s", String.format(Locale.ROOT, "%.0f-%.0f%%", lo * 100, hi * 100));
+            if (bin.isEmpty()) {
+                System.out.println(String.format(Locale.ROOT, "  %s  %6d", range, 0));
+                continue;
+            }
+            double avg = bin.stream().mapToDouble(Pred::p).average().orElse(0);
+            double obs = bin.stream().mapToDouble(Cassandra::outcome).average().orElse(0);
+            double gap = (obs - avg) * 100;
+            String v = bin.size() < 5 ? "too few to judge"
+                    : Math.abs(gap) <= 10 ? "well calibrated"
+                    : gap < 0 ? String.format(Locale.ROOT, "forecasts too high by %.0f pts", -gap)
+                    : String.format(Locale.ROOT, "forecasts too low by %.0f pts", gap);
+            System.out.println(String.format(Locale.ROOT, "  %s  %6d  %11.0f%%  %8.0f%%  %s",
+                    range, bin.size(), avg * 100, obs * 100, v));
+        }
+
+        // ---- over time
+        System.out.println("\nBRIER SCORE BY WEEK (week starting, by date graded)");
+        System.out.println("  week of      graded  Cassandra  before recal  Cassandra vs base rate");
+        Map<LocalDate, List<Pred>> byWeek = new TreeMap<>();
+        for (Pred p : graded) {
+            LocalDate d = resolvedOn(p);
+            byWeek.computeIfAbsent(d.minusDays(d.getDayOfWeek().getValue() - 1), k -> new ArrayList<>()).add(p);
+        }
+        List<LocalDate> weeks = new ArrayList<>(byWeek.keySet());
+        for (LocalDate w : weeks.subList(Math.max(0, weeks.size() - 12), weeks.size())) {
+            List<Pred> ps = byWeek.get(w);
+            List<Pred> cs = ps.stream().filter(p -> base.containsKey(p.id())).toList();
+            String br = cs.isEmpty() ? "n/a" : String.format(Locale.ROOT, "%.3f vs %.3f (on %d)",
+                    brier(cs, Pred::p), brier(cs, p -> base.get(p.id())), cs.size());
+            System.out.println(String.format(Locale.ROOT, "  %s  %6d  %9.3f  %12.3f  %s", w, ps.size(),
+                    brier(ps, Pred::p), brier(ps, Pred::pRaw), br));
+        }
+        if (weeks.size() > 12) System.out.println("  (showing the last 12 weeks)");
+
+        System.out.println("\n" + wrap("HOW TO READ THIS: the base-rate forecaster is the opponent that matters. For each "
+                + "prediction it simply forecasts how often that type of claim had come true so far, using only "
+                + "results known at the time. Beating a coin flip is easy when most claims are usually true; beating "
+                + "the base rate means Cassandra's reading of the news is adding something.", ""));
     }
 
     // ------------------------------------------------------------------ trend model

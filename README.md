@@ -1,37 +1,120 @@
-![Splash image](splash.jpg)
-
 # Cassandra
 
 > A news-driven forecaster that commits to testable predictions, keeps score, and corrects its own overconfidence.
 
 Cassandra reads headlines from RSS feeds, finds the leading stories, projects their coverage forward, issues dated and falsifiable predictions with probabilities, and writes a plain-English scenario of what may follow. Every later run grades the predictions that have fallen due, reports a track record, and recalibrates future probabilities accordingly.
 
-Nobody can see the future, and Cassandra doesn't claim to. What she can do is make claims you can check, and tell you honestly how well they have held up. See [Limitations](#limitations).
+Nobody can see the future, and Cassandra doesn't claim to. What she can do is make claims you can check, and tell you honestly how well they have held up. See [How accurate is she?](#how-accurate-is-she) and [Limitations](#limitations).
+
+## How accurate is she?
+
+**On real news: not yet known.** No live track record has been published yet. A fair verdict needs at least a few weeks of daily runs, and this section will be updated with the real `--report` output once there is one. Until then, treat every probability she gives as unproven.
+
+What *can* be said is how she is judged, and that the judging is built to be hard to pass.
+
+### How she is scored
+
+Every prediction is logged with the date it was made, its due date and its probability, then graded automatically when it falls due (see [How it works](#how-it-works)). `java Cassandra --report` scores the whole record against three opponents:
+
+| Opponent | What it does | Why it matters |
+|---|---|---|
+| **Coin flip** | Always says 50% | The bare minimum. Easy to beat, because many claims (such as "the leading story will still be in the top 5") are usually true. |
+| **Base-rate forecaster** | For each prediction, says how often that type of claim had come true so far, using only results known on the day | **The opponent that matters.** Beating it means Cassandra's reading of the news adds something beyond "what usually happens". |
+| **Herself, before recalibration** | Her raw probabilities | Shows whether the self-correction actually helps. |
+
+Scores use the **Brier score**: the average squared gap between the probability given and what happened (1 if it came true, 0 if not). 0 is perfect, and always saying 50% scores 0.250.
+
+The headline number is the **skill score**, `1 − Brier(Cassandra) / Brier(base rate)`. Above 0, she beats the base rate; 0 means no better; below 0 means worse.
+
+To stop the report flattering her:
+
+- **No verdict until there is evidence.** The base-rate forecaster needs 5 earlier results of a type before it makes a forecast, and the report gives no verdict until 30 predictions can be compared.
+- **An honest margin of error.** The 90% interval on the skill score is bootstrapped by resampling *whole days*, because predictions made on the same day are about the same stories and tend to succeed or fail together.
+- **Three possible verdicts:** she beats the base rate (the whole interval is above 0), she is worse (the whole interval is below 0), or she cannot yet be told apart from it.
+- **Where she goes wrong.** A reliability table shows, for each band of forecasts (0–20%, 20–40% …), how often those claims actually came true.
+
+### What the report looks like
+
+Abridged output after 35 days of `--demo` runs (synthetic headlines, not real news):
+
+```
+THE SHORT ANSWER
+  Cassandra is doing WORSE than simply forecasting how often each type of claim usually
+  comes true. Treat her probabilities with suspicion.
+  Skill score -0.17 over 237 comparable predictions (90% interval -0.28 to -0.08). 0 means
+  no better than the base rate, 1 would be perfect, below 0 is worse.
+
+BRIER SCORES (lower is better; 0 is perfect)
+  All 294 graded predictions:
+    Cassandra (issued probabilities)    0.178
+    Cassandra before recalibration      0.203
+    Coin flip (always 50%)              0.250
+  The 237 predictions the base-rate forecaster could also make:
+    Cassandra                           0.179
+    Base-rate forecaster                0.153
+
+BY PREDICTION TYPE
+  type             graded  came true  avg forecast   Brier   skill vs base rate
+  SHARE_UP@3           80        36%           42%   0.290   -0.28 (on 68)
+  TONE_PERSIST@3       62        95%           87%   0.067   -0.05 (on 52)
+  TOP5@3               80        85%           84%   0.147   -0.09 (on 68)
+  TOP5@7               72        83%           77%   0.184   -0.10 (on 49)
+
+RELIABILITY (when she says X%, does it happen X% of the time?)
+  forecast  graded  avg forecast  came true  verdict
+  0-20%         11           10%        45%  forecasts too low by 35 pts
+  20-40%        20           33%        50%  forecasts too low by 17 pts
+  40-60%        54           49%        46%  well calibrated
+  60-80%        69           72%        81%  well calibrated
+  80-100%      140           90%        86%  well calibrated
+
+BRIER SCORE BY WEEK (week starting, by date graded)
+  week of      graded  Cassandra  before recal  Cassandra vs base rate
+  2026-10-05      61      0.153         0.160  0.171 vs 0.136 (on 23)
+  2026-10-12      69      0.209         0.230  0.202 vs 0.157 (on 55)
+  2026-10-19      70      0.150         0.188  0.150 vs 0.133 (on 70)
+  2026-10-26      61      0.217         0.238  0.217 vs 0.191 (on 61)
+```
+
+How to read this demo result:
+
+- **She beats a coin flip easily** (0.178 against 0.250), which would look impressive on its own.
+- **She loses to the base rate**, and the interval says this is not bad luck. That is the right answer for the demo: its headlines are random draws from a fixed set, so there is nothing to read beyond how often each kind of claim usually comes true. The report is not rigged in her favour.
+- **`SHARE_UP` is her weakest prediction** (skill −0.28). Day-to-day swings in a story's share of coverage are hard to call.
+- **Her low forecasts are too low.** Claims she rated under 20% likely came true 45% of the time.
+- **Recalibration helps** (0.203 → 0.178), but not enough to close the gap.
+
+### Producing a real track record
+
+```bash
+# run daily, e.g. from cron, for four weeks or more
+java Cassandra
+
+# then
+java Cassandra --report
+```
+
+`--report` only reads `predictions.tsv`; it fetches nothing and changes nothing, so you can run it as often as you like.
 
 ## What's new
 
-### Predictions for the top 3 stories
+### Accuracy report (`--report`)
 
-Cassandra used to make predictions only about the single dominant story. She now makes them for each of the **top 3 stories** of the day, grouped by story in the output.
+A full accuracy report built from the saved predictions; see [How accurate is she?](#how-accurate-is-she) for what it shows and why.
 
-- **Faster learning.** About three times as many predictions are graded each day. In a 12-day demo run, 78 predictions were graded. All three 3-day prediction types had passed the 5-result threshold for recalibration by day 6, and the 7-day type by day 10.
-- **Rank-aware priors.** A story in third place is less secure in the top 5 than the leader, so its starting `TOP5` probability is lowered by 7 percentage points per rank (`RANK_PENALTY`).
-- **One shared track record.** All stories feed the same per-type statistics, so calibration learns from every prediction, whichever story it was about.
-- The number of stories is set by `PREDICTED_STORIES`.
+- **Skill score against a base-rate forecaster**, with a 90% interval and a plain-English verdict
+- **Brier scores** for Cassandra, Cassandra before recalibration, the base-rate forecaster and a coin flip
+- **Per-type breakdown**, including skill for each prediction type
+- **Reliability table**: how often claims in each probability band came true, with "too high" / "too low" verdicts
+- **Brier score by week**, to show whether she is improving
+- The normal track record at the end of each run now also gives the skill score against the base rate, or says it is too early to compare.
 
-### Fair trends for new stories
+### Earlier in this release
 
-Previously, the days before a story existed counted as 0% coverage, so every new story looked like a steep riser and its `SHARE_UP` forecast was inflated exactly when the story was most likely to fade.
-
-- The trend is now fitted **only from the day a story first appeared** in the top 10. A day it drops out *after* appearing still counts as a negligible share, because that drop is real.
-- New stories are labelled **"new today"** in the predictions list.
-- The coverage forecast explains why there is no trend yet: no history at all, a **new story**, or a **young story** with fewer than 3 days of data. Until a trend is available, `SHARE_UP` falls back on today's momentum.
-- The trend line now says when the data starts, e.g. `Trend over 4 days of data (since 2026-10-03)`.
-
-### Smaller improvements
-
-- **Livelier demo.** `--demo` headlines now change from day to day: a port strike that slowly fades, a steady AI chip story, and a storm that breaks on 3 October and grows. The mix is random but reproducible (the same date always gives the same headlines).
-- **Tidier output.** Wrapped prediction lines now have a hanging indent.
+- **Predictions for the top 3 stories.** Each of the top 3 stories gets its own predictions, so about three times as many are graded each day and recalibration starts within the first week. Lower-ranked stories start with a lower `TOP5` probability (`RANK_PENALTY`).
+- **Fair trends for new stories.** The trend is fitted only from the day a story first appeared in the top 10, instead of counting the days before as 0% coverage. New stories are labelled "new today", and the forecast explains when there is not yet enough data for a trend.
+- **Livelier demo.** `--demo` headlines change from day to day: a fading port strike, a steady AI chip story, and a storm that breaks on 3 October and grows.
+- **Tidier output.** Wrapped prediction lines have a hanging indent.
 
 Existing `history.tsv` and `predictions.tsv` files work unchanged.
 
@@ -43,7 +126,8 @@ Existing `history.tsv` and `predictions.tsv` files work unchanged.
 - **Trend forecast:** fits a line through the dominant story's share of coverage since it first appeared and projects it 3 and 7 days ahead with an 80% range
 - **Dated predictions:** up to four predictions for each of the top 3 stories every run, each with a probability
 - **Self-grading:** predictions are graded automatically when they fall due
-- **Track record:** hit rate and Brier score per prediction type, compared with a coin-flip baseline
+- **Track record:** hit rate and Brier score per prediction type, compared with a coin flip and a base-rate forecaster
+- **Accuracy report (`--report`):** skill score with an interval, reliability table and weekly Brier scores
 - **Recalibration:** once a prediction type has 5+ graded results, its probabilities are shifted to correct systematic over- or under-confidence
 - A three-stage narrative (days, weeks, months) plus an alternative branch for the dominant story
 - Offline `--demo` mode with a multi-day storyline
@@ -52,12 +136,12 @@ Existing `history.tsv` and `predictions.tsv` files work unchanged.
 ## Requirements
 
 - Java 16 or later
-- An internet connection for live feeds (not needed for `--demo`)
+- An internet connection for live feeds (not needed for `--demo` or `--report`)
 
 ## Quick start
 
 ```bash
-git clone https://github.com/RDMachinery/Cassandra.git
+git clone https://github.com/<your-username>/Cassandra.git
 cd Cassandra
 
 javac Cassandra.java
@@ -85,6 +169,8 @@ java Cassandra --demo                # offline synthetic headlines (state in ./c
 java Cassandra --data=DIR            # keep history and predictions in DIR
 java Cassandra --no-log              # analyse only; read and write nothing
 java Cassandra --asof=2026-10-01     # pretend today is this date (demos and backtests only)
+java Cassandra --report              # accuracy report from saved predictions; fetches nothing
+java Cassandra --report --demo       # accuracy report for the demo data directory
 java Cassandra --help
 ```
 
@@ -98,11 +184,22 @@ for d in 2026-10-01 2026-10-02 2026-10-03 2026-10-04; do
 done
 ```
 
-On 3 October the storm story appears and is marked "new today", with no trend fitted. The 4 October run grades the predictions made on 1 October. Carry the loop on to 12 October to see recalibration kick in.
+On 3 October the storm story appears and is marked "new today", with no trend fitted. The 4 October run grades the predictions made on 1 October.
+
+To reproduce the accuracy report shown above, run 35 days and then report:
+
+```bash
+for i in $(seq 0 34); do
+  java Cassandra --demo --data=/tmp/cassandra --asof=$(date -d "2026-10-01 +$i day" +%F) > /dev/null
+done
+java Cassandra --report --data=/tmp/cassandra
+```
+
+(On macOS, use `date -v+${i}d -j -f %F 2026-10-01 +%F` in place of the `date -d` call.)
 
 ## Example output
 
-Abridged output from the fourth run above (synthetic headlines, not real news):
+Abridged output from the fourth run of the four-day loop above (synthetic headlines, not real news):
 
 ```
 COVERAGE FORECAST (share of headlines mentioning this story)
@@ -139,6 +236,8 @@ CASSANDRA'S TRACK RECORD
   TOP5@3                2        50%           69%  0.250
   Overall Brier score 0.237 over 5 graded predictions (a coin-flip forecaster scores
   0.250; a perfect one 0.000). Cassandra is currently beating a coin flip. Pending: 29.
+  Too early to compare her with a base-rate forecaster (0 of 30 comparable predictions).
+  Run with --report for details.
 ```
 
 "Top 2" rather than 3 here because only two stories had enough coverage that day.
@@ -157,10 +256,11 @@ CASSANDRA'S TRACK RECORD
    | `SHARE_UP` | Its share of headlines will be higher than today | 3 days |
    | `TONE_PERSIST` | Its coverage will still be clearly negative (or positive); skipped when tone is mixed | 3 days |
 
-   Initial probabilities come from simple priors: the story's rank, its momentum, how many consecutive days it has been in the top 5, tone strength, or its fitted trend for `SHARE_UP` (momentum if there is no trend yet). These are educated guesses, which is why the next two steps matter.
-6. **Grade.** On the first run on or after a prediction's due date (within a 2-day grace period), it is marked true or false. Predictions that cannot be graded (for example, the story vanished before tone could be measured, or no run happened within the grace period) are voided and excluded.
+   Initial probabilities come from simple priors: the story's rank, its momentum, how many consecutive days it has been in the top 5, tone strength, or its fitted trend for `SHARE_UP` (momentum if there is no trend yet). These are educated guesses, which is why the next steps matter.
+6. **Grade.** On the first run on or after a prediction's due date (within a 2-day grace period), it is marked true or false. Predictions that cannot be graded (for example, the story vanished before tone could be measured, or no run happened within the grace period) are voided and excluded from all scores.
 7. **Calibrate.** For each prediction type with 5+ graded results, Cassandra compares her average forecast with how often the claims actually came true and shifts future probabilities in logit space to close the gap, weighted by `n / (n + 10)`. Results from all three stories are pooled per type. The original probability is stored alongside the recalibrated one so the correction never compounds on itself.
-8. **Narrate.** Hand-written causal templates for the dominant story's domain and tone are filled in for days, weeks and months, with the opposite tone offered as an alternative branch.
+8. **Score.** Each run's track record gives Brier scores per type and the skill score against the base-rate forecaster. `--report` adds the interval, verdict, reliability table and weekly scores described in [How accurate is she?](#how-accurate-is-she).
+9. **Narrate.** Hand-written causal templates for the dominant story's domain and tone are filled in for days, weeks and months, with the opposite tone offered as an alternative branch.
 
 ## Saved state
 
@@ -170,6 +270,8 @@ Two plain tab-separated files in the data directory (default `./cassandra-data`)
 |---|---|
 | `history.tsv` | date, term, rank, article count, total articles, net sentiment |
 | `predictions.tsv` | id, made, due, term, label, kind, param, raw probability, issued probability, outcome, resolved on |
+
+`predictions.tsv` is the complete track record: every prediction ever made, with its probability and outcome. It is plain text, so anyone can check the scores independently.
 
 Delete the directory to reset Cassandra's memory. Re-running on the same day replaces that day's history rows and never duplicates predictions.
 
@@ -185,19 +287,24 @@ Everything lives in `Cassandra.java`:
 | Trend look-back window | `HISTORY_DAYS` |
 | Graded results needed before recalibrating | `MIN_FOR_CALIBRATION` |
 | Grace period for grading | `GRACE_DAYS` |
+| Earlier results the base-rate forecaster needs | `BASE_WARMUP` |
+| Comparable predictions needed before `--report` gives a verdict | `MIN_FOR_VERDICT` |
+| Bootstrap resamples for the skill-score interval | `BOOTSTRAP` |
 | Stopwords, sentiment and domain vocabularies | `STOP`, `NEG`, `POS`, `LEX` |
 | Initial probability priors and new prediction types | `makePredictions`, `resolve`, `statement` |
 | Narrative templates | `chain(Domain)` |
 | Demo headlines and storyline | `DEMO_PORT`, `DEMO_CHIP`, `DEMO_STORM`, `DEMO_FILLER`, `demoArticles` |
 
-To add a prediction type, create it in `makePredictions`, grade it in `resolve`, and describe it in `statement`. Tracking and calibration pick it up automatically, for every leading story.
+To add a prediction type, create it in `makePredictions`, grade it in `resolve`, and describe it in `statement`. Tracking, calibration and the accuracy report pick it up automatically, for every leading story.
 
 ## Limitations
 
 - **It cannot foresee events.** The predictions are about news coverage (what will be in the headlines, how big it will be, what tone it will have), not about the underlying events. The narrative is template-based and will sound plausible whatever the facts. Do not use any of it for financial, political or safety decisions.
+- **No live track record yet.** The only accuracy figures so far come from synthetic demo data.
 - **Early probabilities are guesses.** Until a prediction type has 5+ graded results it is uncalibrated, and with only a handful of results the track record is statistically noisy.
+- **The interval is approximate.** Resampling by day allows for predictions on the same day being linked, but not for links across days (the same story is predicted about on several days running), so the true uncertainty is somewhat wider.
 - **Calibration is pooled across ranks.** The rank penalty is a fixed guess; if Cassandra is well calibrated for the leading story but not for the third, the pooled correction will only partly fix it.
-- **A cold start takes time.** No trend appears until three different days have been recorded, and the first grades arrive three days after the first run.
+- **A cold start takes time.** No trend appears until three different days have been recorded, the first grades arrive three days after the first run, and a verdict needs a few weeks.
 - **Story identity can drift.** A story is tracked by its top-ranked term; if the leading word changes from day to day, history for that story may be split, and it may be treated as new.
 - **Sentiment is crude.** A small word list cannot handle negation or sarcasm.
 - **Coverage is not reality.** Feeds are editorial selections, and the result reflects what these outlets chose to publish.
@@ -209,9 +316,9 @@ Planned features, roughly in priority order. None of these are implemented yet.
 
 ### Better learning
 
-- **Stronger baselines.** Report a Brier *skill score* against each type's historical base rate (for example, "stories in the top 5 stay there 70% of the time"), not only against a coin flip, which is an easy bar to clear.
-- **Calibration report (`--report`).** A reliability table built from `predictions.tsv`: forecasts grouped into bins (0–20%, 20–40% …) against how often they came true, plus a Brier score trend over time. Optionally written as an HTML chart.
+- **Fix the low-probability bias.** The demo report shows claims rated under 20% coming true far more often than forecast; the `SHARE_UP` prior is the main suspect.
 - **New prediction types.** For example `DROP_OUT` (the story leaves the top 10 within 7 days) and `OUTLETS_UP` (more outlets covering it in 3 days).
+- **HTML accuracy report.** A reliability diagram and weekly Brier chart as a self-contained HTML page.
 
 ### Backtesting
 
@@ -240,7 +347,7 @@ Check the terms of use of any feed you point Cassandra at. She sends a descripti
 
 ## Contributing
 
-Issues and pull requests are welcome. If you change priors, lexicons or templates, include a short before/after example in the PR description.
+Issues and pull requests are welcome. If you change priors, lexicons or templates, include a short before/after example in the PR description, ideally with `--report` output from the same data before and after.
 
 ## License
 
