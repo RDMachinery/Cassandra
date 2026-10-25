@@ -1,3 +1,5 @@
+![banner image](splash.jpg)
+
 # Cassandra
 
 > A news-driven forecaster that commits to testable predictions, keeps score, and corrects its own overconfidence.
@@ -6,9 +8,9 @@ Cassandra reads headlines from RSS feeds, finds the leading stories, projects th
 
 Nobody can see the future, and Cassandra doesn't claim to. What she can do is make claims you can check, and tell you honestly how well they have held up. See [How accurate is she?](#how-accurate-is-she) and [Limitations](#limitations).
 
-![Cassandra's desktop window, showing the Today tab: three story cards with predictions, a coverage chart and headlines](docs/today-tab.png)
+![Cassandra's desktop window, showing the Today tab: three story cards with predictions, a coverage chart and headlines](today-tab.png)
 
-*The Today tab of the desktop window (`--gui`), after 35 days of synthetic demo data. The [Accuracy tab](#desktop-window) shows how well her predictions have held up.*
+*The Today tab of the desktop window (`--gui`), after 35 days of synthetic demo data shows how well her predictions have held up.*
 
 ## How accurate is she?
 
@@ -140,6 +142,8 @@ A Swing window that shows Cassandra's accuracy as charts instead of text, on its
 - **Safe saves.** `history.tsv` and `predictions.tsv` are written to a temporary file and then renamed into place, so anything reading them, such as the window, never sees a half-written file.
 
 ### Earlier in this release
+
+![Accuracy screenshot](accuracy-tab.png)
 
 - **Accuracy report (`--report`).** Skill score against a base-rate forecaster with a 90% interval and a plain-English verdict, Brier scores against three benchmarks, a per-type breakdown, a reliability table and weekly Brier scores. The end-of-run track record also gives the skill score. See [How accurate is she?](#how-accurate-is-she).
 - **Predictions for the top 3 stories.** Each of the top 3 stories gets its own predictions, so about three times as many are graded each day and recalibration starts within the first week. Lower-ranked stories start with a lower `TOP5` probability (`RANK_PENALTY`).
