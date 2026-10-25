@@ -75,13 +75,16 @@ public class Cassandra {
             "https://www.theguardian.com/business/rss",
             "https://www.theguardian.com/technology/rss");
 
-    static final int MIN_ARTICLES = 8;
     static final int WRAP = 90;
-    static final int HISTORY_DAYS = 14;        // how far back the trend fit looks
-    static final int MIN_FOR_CALIBRATION = 5;  // resolved predictions needed before recalibrating
-    static final int GRACE_DAYS = 2;           // a prediction not graded within this window is void
-    static final int PREDICTED_STORIES = 3;    // how many of the leading stories get predictions
-    static final double RANK_PENALTY = 0.07;   // TOP5 prior is lowered by this much per rank below #1
+
+    // Settings: these defaults apply unless the data folder's cassandra.properties says otherwise
+    // (see Settings and loadSettings). The window's Settings tab edits that file.
+    static int MIN_ARTICLES = 8;               // fewer headlines than this and a run stops without saving
+    static int HISTORY_DAYS = 14;              // how far back the trend fit looks
+    static int MIN_FOR_CALIBRATION = 5;        // resolved predictions needed before recalibrating
+    static int GRACE_DAYS = 2;                 // a prediction not graded within this window is void
+    static int PREDICTED_STORIES = 3;          // how many of the leading stories get predictions
+    static double RANK_PENALTY = 0.07;         // TOP5 prior is lowered by this much per rank below #1
     static final LocalDate DEMO_START = LocalDate.of(2026, 10, 1); // day 0 of the demo storyline
 
     static Instant NOW = Instant.now();
@@ -224,12 +227,13 @@ public class Cassandra {
 
     public static void main(String[] args) throws IOException {
         boolean demo = false, log = true;
-        String dataArg = null;
+        String dataArg = null, replayArg = null;
         boolean asof = false, accuracy = false, gui = false;
         List<String> feeds = new ArrayList<>();
 
         for (String a : args) {
             if (a.equals("--demo")) demo = true;
+            else if (a.startsWith("--replay=")) replayArg = a.substring(9);
             else if (a.equals("--report")) accuracy = true;
             else if (a.equals("--gui")) gui = true;
             else if (a.equals("--no-log")) log = false;
@@ -241,28 +245,25 @@ public class Cassandra {
             } else if (a.equals("--help") || a.equals("-h")) { usage(); return; }
             else feeds.add(a);
         }
+        if (replayArg != null) {
+            replayCommand(Paths.get(replayArg), dataArg == null ? null : Paths.get(dataArg));
+            return;
+        }
         if (asof && !demo)
             System.out.println("Warning: --asof is meant for --demo/backtests; live headlines are dated in real time.\n");
 
         Path dir = Paths.get(dataArg != null ? dataArg : demo ? "cassandra-demo-data" : "cassandra-data");
-        if (gui) { Gui.open(dir); return; }
+        if (gui) { Gui.open(dir, demo); return; }
+        Settings settings = loadSettings(dir);   // the folder's cassandra.properties, or the defaults
+        settings.apply();
         if (accuracy) { accuracyReport(dir); return; }
-        List<Article> articles = new ArrayList<>();
+        List<Article> articles;
 
         if (demo) {
             articles = demoArticles();
             System.out.println("[demo mode: synthetic headlines, not real news]\n");
         } else {
-            for (String url : feeds.isEmpty() ? DEFAULT_FEEDS : feeds) {
-                try {
-                    List<Article> got = fetchFeed(url);
-                    System.out.printf("Fetched %2d items from %s%n", got.size(), url);
-                    articles.addAll(got);
-                } catch (Exception e) {
-                    System.out.printf("Could not read %s (%s)%n", url, e.getMessage());
-                }
-            }
-            System.out.println();
+            articles = fetchAll(feeds.isEmpty() ? settings.feeds() : feeds);   // command-line feeds win
         }
 
         articles = dedupe(articles);
@@ -284,10 +285,28 @@ public class Cassandra {
                   --asof=DATE     pretend today is DATE (yyyy-mm-dd); demos and backtests only
                   --report        print an accuracy report from saved predictions (no feeds are fetched)
                   --gui           open the desktop window (use with --data=DIR or --demo to pick the data)
+                  --replay=DIR    re-run Cassandra over DIR's archived headlines into a fresh folder
+                                  (--data=OUT, default DIR-replay), then report its accuracy
                 """);
     }
 
     // ------------------------------------------------------------------ fetching
+
+    /** Fetch every feed, reporting each one, and return all their headlines (duplicates included). */
+    static List<Article> fetchAll(List<String> feeds) {
+        List<Article> articles = new ArrayList<>();
+        for (String url : feeds) {
+            try {
+                List<Article> got = fetchFeed(url);
+                System.out.printf("Fetched %2d items from %s%n", got.size(), url);
+                articles.addAll(got);
+            } catch (Exception e) {
+                System.out.printf("Could not read %s (%s)%n", url, e.getMessage());
+            }
+        }
+        System.out.println();
+        return articles;
+    }
 
     static List<Article> fetchFeed(String url) throws Exception {
         HttpClient client = HttpClient.newBuilder()
@@ -473,7 +492,13 @@ public class Cassandra {
     }
 
     static void report(List<Article> articles, Path dir, boolean log) throws IOException {
-        RunResult r = forecastRun(articles, dir, log);
+        RunResult r;
+        try {
+            r = forecastRun(articles, dir, log);
+        } catch (BusyException e) {
+            System.out.println(e.getMessage());
+            return;
+        }
         if (r == null) {
             System.out.println("No topic appears in enough articles to call it a trend.");
             return;
@@ -487,6 +512,18 @@ public class Cassandra {
      * Returns null when no story has enough coverage to call it a trend.
      */
     static RunResult forecastRun(List<Article> articles, Path dir, boolean log) throws IOException {
+        return forecastRun(articles, dir, log, log);
+    }
+
+    /** As above; archive says whether a saving run also archives its headlines (replays don't). */
+    static RunResult forecastRun(List<Article> articles, Path dir, boolean log, boolean archive) throws IOException {
+        // saving runs hold the folder's lock from reading to writing, so two runs can't overwrite each other
+        return log ? withLock(dir, () -> forecastRunUnlocked(articles, dir, true, archive))
+                : forecastRunUnlocked(articles, dir, false, false);
+    }
+
+    static RunResult forecastRunUnlocked(List<Article> articles, Path dir, boolean log, boolean archive)
+            throws IOException {
         List<Doc> docs = articles.stream().map(Cassandra::analyse).toList();
 
         // 1. Index and rank terms
@@ -562,6 +599,7 @@ public class Cassandra {
         RunResult result = new RunResult(TODAY, docs.size(), top, domain, sources, related, anyPriorRuns, fresh,
                 toAdd.size(), log, gradedNow, record, preds, samples, others, scenario(lead, domain, related, sources));
         if (log) saveLatest(dir, result);
+        if (archive) saveArchive(dir, articles);
         return result;
     }
 
@@ -1168,6 +1206,264 @@ public class Cassandra {
         return new Forecast(n, slope, a, sd, xbar, sxx);
     }
 
+    // ------------------------------------------------------------------ settings (cassandra.properties)
+
+    static final String CONFIG = "cassandra.properties";
+
+    /** Everything a data folder can configure. Each run loads its folder's settings first. */
+    record Settings(List<String> feeds, int minArticles, int predictedStories, double rankPenalty,
+                    int historyDays, int minForCalibration, int graceDays) {
+        static Settings defaults() { return new Settings(DEFAULT_FEEDS, 8, 3, 0.07, 14, 5, 2); }
+
+        /** Use these settings for the runs that follow. */
+        void apply() {
+            MIN_ARTICLES = minArticles;
+            PREDICTED_STORIES = predictedStories;
+            RANK_PENALTY = rankPenalty;
+            HISTORY_DAYS = historyDays;
+            MIN_FOR_CALIBRATION = minForCalibration;
+            GRACE_DAYS = graceDays;
+        }
+    }
+
+    /** The folder's settings, or the defaults for anything it does not set (or sets out of range). */
+    static Settings loadSettings(Path dir) {
+        Settings d = Settings.defaults();
+        Path f = dir.resolve(CONFIG);
+        if (!Files.exists(f)) return d;
+        Properties p = new Properties();
+        try (var in = Files.newBufferedReader(f, StandardCharsets.UTF_8)) {
+            p.load(in);
+        } catch (IOException e) {
+            System.out.println("Could not read " + f + " (" + e.getMessage() + "); using default settings.");
+            return d;
+        }
+        List<String> feeds = p.stringPropertyNames().stream().filter(k -> k.matches("feed\\.\\d+"))
+                .sorted(Comparator.comparingInt(k -> Integer.parseInt(k.substring(5))))
+                .map(k -> p.getProperty(k).trim()).filter(u -> !u.isEmpty()).toList();
+        return new Settings(feeds.isEmpty() ? d.feeds() : feeds,
+                (int) setting(p, "min.articles", d.minArticles(), 3, 50),
+                (int) setting(p, "predicted.stories", d.predictedStories(), 1, 5),
+                setting(p, "rank.penalty", d.rankPenalty(), 0, 0.2),
+                (int) setting(p, "history.days", d.historyDays(), 3, 60),
+                (int) setting(p, "calibration.min", d.minForCalibration(), 2, 50),
+                (int) setting(p, "grace.days", d.graceDays(), 0, 7));
+    }
+
+    static double setting(Properties p, String key, double def, double lo, double hi) {
+        String v = p.getProperty(key);
+        if (v == null) return def;
+        try {
+            double x = Double.parseDouble(v.trim());
+            if (x >= lo && x <= hi) return x;
+        } catch (NumberFormatException ignored) { /* reported below */ }
+        System.out.println(CONFIG + ": ignoring " + key + "=" + v.trim() + " (must be a number from "
+                + plain(lo) + " to " + plain(hi) + "); using " + plain(def) + ".");
+        return def;
+    }
+
+    /** 0.07 rather than 0.07000, 2 rather than 2.0. */
+    static String plain(double x) {
+        return java.math.BigDecimal.valueOf(x).stripTrailingZeros().toPlainString();
+    }
+
+    static void saveSettings(Path dir, Settings s) throws IOException {
+        Files.createDirectories(dir);
+        List<String> out = new ArrayList<>(List.of(
+                "# Cassandra settings for this data folder. Every run (including scheduled ones) reads this file.",
+                "# Edit it here or in the window's Settings tab. Delete it to go back to the defaults.",
+                "",
+                "# News feeds (RSS 2.0). Feeds given on the command line take priority over these."));
+        for (int i = 0; i < s.feeds().size(); i++) out.add("feed." + (i + 1) + "=" + s.feeds().get(i));
+        out.addAll(List.of("",
+                "# A run with fewer headlines than this stops without saving (3-50)",
+                "min.articles=" + s.minArticles(),
+                "# How many of the day's leading stories get predictions (1-5)",
+                "predicted.stories=" + s.predictedStories(),
+                "# Starting 'still in the top 5' probability is lowered by this much per rank below first (0-0.2)",
+                "rank.penalty=" + String.format(Locale.ROOT, "%.2f", s.rankPenalty()),
+                "# Days of history the coverage trend is fitted over (3-60)",
+                "history.days=" + s.historyDays(),
+                "# Graded results a prediction type needs before its probabilities are recalibrated (2-50)",
+                "calibration.min=" + s.minForCalibration(),
+                "# Days after its due date that a prediction can still be graded; later, it is voided (0-7)",
+                "grace.days=" + s.graceDays()));
+        writeAtomically(dir.resolve(CONFIG), out);
+    }
+
+    // ------------------------------------------------------------------ headline archive and replay
+
+    static final String ARCHIVE = "archive";
+
+    /** One archived run: its date, the moment it ran (article ages are measured from it), and its headlines. */
+    record ArchiveDay(LocalDate date, Instant ran, List<Article> articles) {}
+
+    /**
+     * Keep the exact headlines a saving run analysed, in archive/YYYY-MM-DD.tsv: a "#ran" line with the run's
+     * time, then one line per headline (source, published, title, body, link). Re-running a day replaces it.
+     */
+    static void saveArchive(Path dir, List<Article> articles) throws IOException {
+        Path a = dir.resolve(ARCHIVE);
+        Files.createDirectories(a);
+        List<String> out = new ArrayList<>();
+        out.add("#ran\t" + NOW);
+        for (Article x : articles)
+            out.add(String.join("\t", cell(x.source()), x.published().toString(), cell(x.title()), cell(x.body()),
+                    cell(x.link())));
+        writeAtomically(a.resolve(TODAY + ".tsv"), out);
+    }
+
+    /** The folder's archived days, oldest first. */
+    static List<Path> archiveFiles(Path dir) {
+        Path a = dir.resolve(ARCHIVE);
+        if (!Files.isDirectory(a)) return List.of();
+        try (var s = Files.list(a)) {
+            return s.filter(p -> p.getFileName().toString().matches("\\d{4}-\\d{2}-\\d{2}\\.tsv")).sorted().toList();
+        } catch (IOException e) {
+            return List.of();
+        }
+    }
+
+    static ArchiveDay loadArchiveDay(Path f) throws IOException {
+        LocalDate date = LocalDate.parse(f.getFileName().toString().substring(0, 10));
+        Instant ran = date.atTime(12, 0).toInstant(ZoneOffset.UTC);
+        List<Article> articles = new ArrayList<>();
+        for (String line : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+            String[] c = line.split("\t", -1);
+            if (c[0].equals("#ran")) { ran = Instant.parse(c[1]); continue; }
+            if (c.length < 5) continue;
+            articles.add(new Article(c[0], c[2], c[3], Instant.parse(c[1]), c[4]));
+        }
+        return new ArchiveDay(date, ran, articles);
+    }
+
+    /**
+     * Re-run the forecaster over src's archived days, in date order, saving into out with the given settings.
+     * Each day runs as it originally did (same date, same run time, same headlines), so with the original
+     * settings a replay reproduces the original track record. Returns the number of days run.
+     */
+    static int replay(Path src, Path out, Settings s, java.util.function.Consumer<String> say,
+                      java.util.function.BooleanSupplier stop) throws IOException {
+        List<Path> files = archiveFiles(src);
+        LocalDate today = TODAY;
+        Instant now = NOW;
+        s.apply();
+        int n = 0;
+        try {
+            for (Path f : files) {
+                if (stop.getAsBoolean()) break;
+                ArchiveDay d = loadArchiveDay(f);
+                TODAY = d.date();
+                NOW = d.ran();
+                FORMS.clear();
+                String day = d.date().format(DateTimeFormatter.ofPattern("EEE d MMM", Locale.UK));
+                if (d.articles().size() < MIN_ARTICLES) {
+                    say.accept(day + ": " + d.articles().size() + " headlines, fewer than the " + MIN_ARTICLES
+                            + " needed; skipped.");
+                    continue;
+                }
+                RunResult r = forecastRun(d.articles(), out, true, false);
+                say.accept(r == null ? day + ": no story had enough coverage."
+                        : String.format(Locale.ROOT, "%s: %d headlines, top story \"%s\"; %d predictions made, %d "
+                        + "graded.", day, r.headlines(), r.lead().label(), r.added(), r.gradedNow().size()));
+                n++;
+            }
+        } finally {
+            TODAY = today;
+            NOW = now;
+        }
+        return n;
+    }
+
+    /** One line summing up a track record, for comparing two of them. */
+    static String compareLine(Accuracy a) {
+        if (a == null || a.graded().isEmpty()) return "nothing graded yet.";
+        String s = String.format(Locale.ROOT, "%d graded, %.0f%% came true against an average forecast of %.0f%%, "
+                + "Brier %.3f, skill vs base rate ", a.graded().size(),
+                100 * a.graded().stream().mapToDouble(Cassandra::outcome).average().orElse(0),
+                100 * a.graded().stream().mapToDouble(Pred::p).average().orElse(0), a.bCass());
+        return s + (a.ci() == null ? num(a.skill(), "%+.2f") + " (provisional)"
+                : String.format(Locale.ROOT, "%+.2f (90%% interval %+.2f to %+.2f)", a.skill(), a.ci()[0], a.ci()[1]))
+                + ".";
+    }
+
+    static boolean holdsTrackRecord(Path dir) {
+        return Files.exists(dir.resolve("history.tsv")) || Files.exists(dir.resolve("predictions.tsv"));
+    }
+
+    /** --replay=SRC [--data=OUT] */
+    static void replayCommand(Path src, Path out) throws IOException {
+        List<Path> files = archiveFiles(src);
+        if (files.isEmpty()) {
+            System.out.println("No archived headlines in " + src.resolve(ARCHIVE).toAbsolutePath().normalize()
+                    + ". Cassandra archives the headlines of every saving run from version 2.0 on, so there is "
+                    + "nothing to replay yet.");
+            return;
+        }
+        Path s = src.toAbsolutePath().normalize();
+        if (out == null) out = s.resolveSibling(s.getFileName() + "-replay");
+        if (out.toAbsolutePath().normalize().equals(s) || holdsTrackRecord(out)) {
+            System.out.println(wrap("Not replaying into " + out.toAbsolutePath().normalize() + ": it already holds a "
+                    + "track record, and replaying into it would mix two. Delete it, or choose an empty folder with "
+                    + "--data=DIR.", ""));
+            return;
+        }
+        boolean own = Files.exists(out.resolve(CONFIG));
+        Settings settings = own ? loadSettings(out) : loadSettings(src);
+        String bar = "=".repeat(WRAP);
+        System.out.println(bar);
+        System.out.println(" CASSANDRA - replay of " + files.size() + " archived days");
+        System.out.println(bar);
+        System.out.println("From: " + s.resolve(ARCHIVE));
+        System.out.println("Into: " + out.toAbsolutePath().normalize());
+        System.out.println(wrap("Settings: " + (own ? "from " + out.resolve(CONFIG).toAbsolutePath().normalize()
+                : (Files.exists(src.resolve(CONFIG)) ? "copied from " + s.resolve(CONFIG) : "the defaults")
+                + ". To test other settings, put a cassandra.properties in the output folder first."), ""));
+        System.out.println();
+        int n = replay(src, out, settings, System.out::println, () -> false);
+        if (own) { /* the output folder already has its settings file */ }
+        else if (Files.exists(src.resolve(CONFIG))) saveSettings(out, settings);   // keep a record of what was used
+        System.out.println("\nReplayed " + n + " of " + files.size() + " days.\n");
+        Accuracy a = loadAccuracy(out);
+        if (a != null) printAccuracy(a);
+        Accuracy orig = holdsTrackRecord(src) ? loadAccuracy(src) : null;
+        if (orig != null) {
+            System.out.println("\nCOMPARED WITH THE ORIGINAL RUNS");
+            System.out.println(wrap("Original (" + s + "): " + compareLine(orig), "  "));
+            System.out.println(wrap("This replay: " + compareLine(a), "  "));
+            System.out.println(wrap("With the same settings and a complete archive these match exactly. With different "
+                    + "settings, compare the skill scores: if their intervals overlap, the difference may be luck.", "  "));
+        }
+    }
+
+    // ------------------------------------------------------------------ run lock
+
+    static final String LOCK = "cassandra.lock";
+
+    /** Raised when another run (scheduled, or from the window) is saving to the same folder. */
+    @SuppressWarnings("serial")
+    static final class BusyException extends IOException {
+        BusyException() {
+            super("Another Cassandra run is saving to this data folder right now, so this run stopped without "
+                    + "saving. Try again in a moment.");
+        }
+    }
+
+    interface IOWork<T> { T run() throws IOException; }
+
+    /** Run work while holding the data folder's lock (an OS file lock on cassandra.lock). */
+    static <T> T withLock(Path dir, IOWork<T> work) throws IOException {
+        Files.createDirectories(dir);
+        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(dir.resolve(LOCK),
+                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
+             java.nio.channels.FileLock lock = ch.tryLock()) {
+            if (lock == null) throw new BusyException();
+            return work.run();
+        } catch (java.nio.channels.OverlappingFileLockException e) {
+            throw new BusyException();   // held by another run in this same program
+        }
+    }
+
     // ------------------------------------------------------------------ latest-run snapshot (read by the GUI)
 
     static final String LATEST = "latest-run.tsv";
@@ -1537,15 +1833,31 @@ public class Cassandra {
         final JLabel status = new JLabel(" ");
         final JPanel todayHost = new JPanel(new BorderLayout());
         final JPanel accuracyHost = new JPanel(new BorderLayout());
+        final Ledger ledger = new Ledger(frame);
+        final StoryHistory stories = new StoryHistory(this);
+        final JTabbedPane tabs = new JTabbedPane();
+        final JButton choose = new JButton("Choose…");
         Path dir;
+        Path liveDir, demoDir;    // the folders for each mode; demo runs never write to the live folder
+        boolean demoMode;
+        final RunPanel runPanel;
+        final SettingsPanel settingsPanel;
         long lastModified = Long.MIN_VALUE;
         String selectedTerm;   // the story picked on the Today tab, kept across reloads
 
         /** Everything the window shows, read from the data folder in one go. Any part may be missing. */
-        record Loaded(Accuracy accuracy, Latest latest, List<HistRow> history, Map<String, Pred> preds) {}
+        record Loaded(Accuracy accuracy, Latest latest, List<HistRow> history, Map<String, Pred> preds,
+                      Settings settings) {}
 
-        Gui(Path dir) {
+        Gui(Path dir) { this(dir, false); }
+
+        Gui(Path dir, boolean demo) {
             this.dir = dir;
+            this.demoMode = demo;
+            this.liveDir = demo ? Paths.get("cassandra-data") : dir;
+            this.demoDir = demo ? dir : Paths.get("cassandra-demo-data");
+            this.runPanel = new RunPanel(this);
+            this.settingsPanel = new SettingsPanel(this);
             frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
 
             JPanel bar = new JPanel(new BorderLayout(12, 0));
@@ -1554,7 +1866,6 @@ public class Cassandra {
             left.add(new JLabel("Data folder:"));
             folderLabel.setFont(folderLabel.getFont().deriveFont(Font.BOLD));
             left.add(folderLabel);
-            JButton choose = new JButton("Choose…");
             choose.addActionListener(e -> chooseFolder());
             JButton reload = new JButton("Reload");
             reload.addActionListener(e -> reload());
@@ -1564,9 +1875,12 @@ public class Cassandra {
             status.setForeground(MUTED);
             bar.add(status, BorderLayout.EAST);
 
-            JTabbedPane tabs = new JTabbedPane();
             tabs.addTab("Today", todayHost);
             tabs.addTab("Accuracy", accuracyHost);
+            tabs.addTab("Predictions", ledger);
+            tabs.addTab("Story history", stories);
+            tabs.addTab("Run", runPanel);
+            tabs.addTab("Settings", settingsPanel);
             frame.getContentPane().add(bar, BorderLayout.NORTH);
             frame.getContentPane().add(tabs, BorderLayout.CENTER);
 
@@ -1593,7 +1907,7 @@ public class Cassandra {
         /** Newest change to the files the window shows; a change triggers a reload. */
         long modified() {
             long m = -1;
-            for (String f : List.of("predictions.tsv", LATEST))
+            for (String f : List.of("predictions.tsv", LATEST, CONFIG))
                 try { m = Math.max(m, Files.getLastModifiedTime(dir.resolve(f)).toMillis()); }
                 catch (IOException ignored) { /* file not there yet */ }
             return m;
@@ -1605,8 +1919,18 @@ public class Cassandra {
             fc.setDialogTitle("Choose a Cassandra data folder (the one holding predictions.tsv)");
             if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION) {
                 dir = fc.getSelectedFile().toPath();
+                if (demoMode) demoDir = dir; else liveDir = dir;
                 reload();
             }
+        }
+
+        /** Switch between live and demo mode; each has its own data folder. */
+        void setDemoMode(boolean demo) {
+            if (demo == demoMode) return;
+            demoMode = demo;
+            dir = demo ? demoDir : liveDir;
+            selectedTerm = null;
+            reload();
         }
 
         void reload() {
@@ -1623,13 +1947,21 @@ public class Cassandra {
                     Map<String, Pred> byId = new HashMap<>();
                     for (Pred p : preds) byId.put(p.id(), p);
                     return new Loaded(any ? computeAccuracy(preds, from) : null, loadLatest(from),
-                            loadHistory(from), byId);
+                            loadHistory(from), byId, loadSettings(from));
                 }
                 @Override protected void done() {
                     Loaded l;
-                    try { l = get(); } catch (Exception ex) { l = new Loaded(null, null, List.of(), Map.of()); }
+                    try { l = get(); } catch (Exception ex) {
+                        l = new Loaded(null, null, List.of(), Map.of(), Settings.defaults());
+                    }
+                    if (!from.equals(dir)) return;   // the folder changed while loading; a newer reload follows
+                    frame.setTitle(demoMode ? "Cassandra (demo data)" : "Cassandra");
+                    runPanel.setData(from, l.history(), l.preds().values());
+                    settingsPanel.setData(from, l.settings());
                     show(todayHost, todayView(l));
                     show(accuracyHost, accuracyView(l.accuracy()));
+                    ledger.setData(l.preds().values());
+                    stories.setData(l.history(), l.preds().values(), l.latest());
                     Accuracy a = l.accuracy();
                     status.setText(a == null ? "No predictions in this folder" : String.format(Locale.ROOT,
                             "%d predictions: %d graded, %d pending, %d void", a.logged(), a.graded().size(),
@@ -1691,6 +2023,7 @@ public class Cassandra {
                     @Override public void mouseClicked(java.awt.event.MouseEvent e) {
                         selectedTerm = card.story.term();
                         select[0].run();
+                        if (e.getClickCount() == 2) showStory(card.story.term());   // double-click: its history
                     }
                 });
             select[0] = () -> {
@@ -2314,6 +2647,11 @@ public class Cassandra {
         }
 
         static String describeType(String key) {
+            return typeLabel(key) + "  (" + key + ")";
+        }
+
+        /** A prediction type ("TOP5@3") in words, without the code. */
+        static String typeLabel(String key) {
             String[] k = key.split("@");
             String what = switch (k[0]) {
                 case "TOP5" -> "Still in the top 5";
@@ -2321,7 +2659,744 @@ public class Cassandra {
                 case "TONE_PERSIST" -> "Tone stays the same";
                 default -> k[0];
             };
-            return what + " after " + (k.length > 1 ? k[1] : "?") + " days  (" + key + ")";
+            return what + " after " + (k.length > 1 ? k[1] : "?") + " days";
+        }
+
+        // ---------------------------------------------------------------- Story history tab
+
+        /** Open the Story history tab on one story. */
+        void showStory(String term) {
+            stories.select(term);
+            tabs.setSelectedComponent(stories);
+        }
+
+        /** Open the Predictions tab showing only one story's predictions. */
+        void showInLedger(String label) {
+            ledger.status.setSelectedIndex(0);
+            ledger.type.setSelectedIndex(0);
+            ledger.search.setText(label);
+            tabs.setSelectedComponent(ledger);
+        }
+
+        /** One story across all runs: when it was in the top 10, how high, and how many predictions it drew. */
+        record StoryStat(String term, String label, LocalDate first, LocalDate last, int days, int bestRank,
+                         int predictions, int graded, int hits) {}
+
+        /**
+         * Pick any story Cassandra has tracked and see its share of headlines and rank over time, with the
+         * predictions made about it on the same timeline. Built once; selection and search survive reloads.
+         */
+        @SuppressWarnings("serial")
+        static final class StoryHistory extends JPanel {
+            static final String[] COLS = {"Story", "Days", "Best", "Last seen", "Predictions"};
+            static final DateTimeFormatter D = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.UK);
+
+            final Gui gui;
+            List<StoryStat> stats = new ArrayList<>();
+            List<HistRow> history = List.of();
+            List<Pred> preds = List.of();
+            String selected;
+
+            final javax.swing.table.AbstractTableModel model = new javax.swing.table.AbstractTableModel() {
+                @Override public int getRowCount() { return stats.size(); }
+                @Override public int getColumnCount() { return COLS.length; }
+                @Override public String getColumnName(int c) { return COLS[c]; }
+                @Override public Class<?> getColumnClass(int c) {
+                    return c == 0 ? String.class : c == 3 ? LocalDate.class : Integer.class;
+                }
+                @Override public Object getValueAt(int r, int c) {
+                    StoryStat s = stats.get(r);
+                    return switch (c) {
+                        case 0 -> s.label();
+                        case 1 -> s.days();
+                        case 2 -> s.bestRank();
+                        case 3 -> s.last();
+                        default -> s.predictions();
+                    };
+                }
+            };
+            final JTable list = new JTable(model);
+            final javax.swing.table.TableRowSorter<javax.swing.table.TableModel> sorter =
+                    new javax.swing.table.TableRowSorter<>(model);
+            final JTextField search = new JTextField(14);
+            final JPanel detail = new JPanel(new BorderLayout());
+            final java.awt.CardLayout cards = new java.awt.CardLayout();
+            final JPanel body = new JPanel(cards);
+            boolean updating;
+
+            StoryHistory(Gui gui) {
+                this.gui = gui;
+                setLayout(new BorderLayout());
+                setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+                // left: searchable list of every story that has been in the top 10
+                list.setRowSorter(sorter);
+                list.setRowHeight(24);
+                list.setShowVerticalLines(false);
+                list.setGridColor(GRID);
+                list.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+                list.getTableHeader().setReorderingAllowed(false);
+                int[] widths = {150, 50, 50, 80, 80};
+                for (int c = 0; c < widths.length; c++) list.getColumnModel().getColumn(c).setPreferredWidth(widths[c]);
+                javax.swing.table.DefaultTableCellRenderer cell = new javax.swing.table.DefaultTableCellRenderer() {
+                    @Override public Component getTableCellRendererComponent(JTable t, Object v, boolean sel,
+                                                                             boolean focus, int r, int c) {
+                        Object shown = v instanceof LocalDate d ? d.format(DateTimeFormatter.ofPattern("d MMM", Locale.UK))
+                                : c == 2 ? "#" + v : v;
+                        super.getTableCellRendererComponent(t, shown, sel, false, r, c);
+                        setHorizontalAlignment(c == 0 ? SwingConstants.LEFT : SwingConstants.RIGHT);
+                        setBorder(BorderFactory.createEmptyBorder(0, 6, 0, 6));
+                        return this;
+                    }
+                };
+                for (int c = 0; c < COLS.length; c++) list.getColumnModel().getColumn(c).setCellRenderer(cell);
+                sorter.setSortKeys(List.of(new RowSorter.SortKey(3, SortOrder.DESCENDING),
+                        new RowSorter.SortKey(1, SortOrder.DESCENDING)));
+                list.getSelectionModel().addListSelectionListener(e -> {
+                    if (updating || e.getValueIsAdjusting()) return;
+                    int r = list.getSelectedRow();
+                    if (r >= 0) {
+                        selected = stats.get(list.convertRowIndexToModel(r)).term();
+                        showDetail();
+                    }
+                });
+                search.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+                    @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { refilter(); }
+                    @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { refilter(); }
+                    @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { refilter(); }
+                });
+
+                JPanel left = new JPanel(new BorderLayout(0, 8));
+                JPanel find = new JPanel(new BorderLayout(6, 0));
+                find.add(new JLabel("Find a story:"), BorderLayout.WEST);
+                find.add(search, BorderLayout.CENTER);
+                left.add(find, BorderLayout.NORTH);
+                JScrollPane sp = new JScrollPane(list);
+                sp.getViewport().setBackground(Color.WHITE);
+                left.add(sp, BorderLayout.CENTER);
+                left.add(wrapped("Every story that has been in the top 10 on at least one run. Days: runs on which "
+                        + "it was in the top 10. Best: its highest rank.", MUTED),
+                        BorderLayout.SOUTH);
+                left.setPreferredSize(new Dimension(390, 100));
+
+                JPanel split = new JPanel(new BorderLayout(12, 0));
+                split.add(left, BorderLayout.WEST);
+                split.add(detail, BorderLayout.CENTER);
+                body.add(split, "stories");
+                body.add(message("No story history in this folder yet.",
+                        "Each run records the day's top 10 stories in history.tsv. They appear here after the first run."),
+                        "empty");
+                add(body, BorderLayout.CENTER);
+            }
+
+            void setData(List<HistRow> hist, Collection<Pred> all, Latest latest) {
+                history = hist;
+                preds = new ArrayList<>(all);
+                Map<String, String> labels = new HashMap<>();
+                preds.stream().sorted(Comparator.comparing(Pred::made)).forEach(p -> labels.put(p.term(), p.label()));
+                if (latest != null) for (SnapStory s : latest.stories()) labels.put(s.term(), s.label());
+
+                Map<String, List<HistRow>> byTerm = new TreeMap<>();
+                for (HistRow r : hist) byTerm.computeIfAbsent(r.term(), k -> new ArrayList<>()).add(r);
+                List<StoryStat> out = new ArrayList<>();
+                for (var e : byTerm.entrySet()) {
+                    List<HistRow> rs = e.getValue();
+                    List<Pred> ps = preds.stream().filter(p -> p.term().equals(e.getKey())).toList();
+                    out.add(new StoryStat(e.getKey(), labels.getOrDefault(e.getKey(), e.getKey()),
+                            rs.stream().map(HistRow::date).min(Comparator.naturalOrder()).orElseThrow(),
+                            rs.stream().map(HistRow::date).max(Comparator.naturalOrder()).orElseThrow(),
+                            (int) rs.stream().map(HistRow::date).distinct().count(),
+                            rs.stream().mapToInt(HistRow::rank).min().orElse(10), ps.size(),
+                            (int) ps.stream().filter(Pred::graded).count(),
+                            (int) ps.stream().filter(p -> p.outcome().equals("TRUE")).count()));
+                }
+                if (selected == null && latest != null) selected = latest.stories().get(0).term();
+                updating = true;
+                stats = out;
+                model.fireTableDataChanged();
+                updating = false;
+                cards.show(body, stats.isEmpty() ? "empty" : "stories");
+                if (stats.stream().noneMatch(s -> s.term().equals(selected)))
+                    selected = stats.isEmpty() ? null : stats.get(list.convertRowIndexToModel(0)).term();
+                select(selected);
+            }
+
+            /** Select a story in the list (clearing the search if it hides it) and show its history. */
+            void select(String term) {
+                if (term == null) return;
+                selected = term;
+                int m = -1;
+                for (int i = 0; i < stats.size(); i++) if (stats.get(i).term().equals(term)) m = i;
+                if (m < 0) return;
+                if (list.convertRowIndexToView(m) < 0) search.setText("");
+                int v = list.convertRowIndexToView(m);
+                updating = true;
+                list.getSelectionModel().setSelectionInterval(v, v);
+                updating = false;
+                list.scrollRectToVisible(list.getCellRect(v, 0, true));
+                showDetail();
+            }
+
+            void refilter() {
+                String q = search.getText().trim().toLowerCase(Locale.ROOT);
+                sorter.setRowFilter(q.isEmpty() ? null : new RowFilter<>() {
+                    @Override public boolean include(Entry<? extends javax.swing.table.TableModel, ? extends Integer> e) {
+                        StoryStat s = stats.get(e.getIdentifier());
+                        return (s.label() + " " + s.term()).toLowerCase(Locale.ROOT).contains(q);
+                    }
+                });
+                // keep the selection highlighted if it is still listed
+                int m = -1;
+                for (int i = 0; i < stats.size(); i++) if (stats.get(i).term().equals(selected)) m = i;
+                int v = m < 0 ? -1 : list.convertRowIndexToView(m);
+                updating = true;
+                if (v >= 0) list.getSelectionModel().setSelectionInterval(v, v); else list.clearSelection();
+                updating = false;
+            }
+
+            void showDetail() {
+                StoryStat s = stats.stream().filter(x -> x.term().equals(selected)).findFirst().orElse(null);
+                if (s == null) return;
+                List<Pred> ps = preds.stream().filter(p -> p.term().equals(s.term())).toList();
+
+                JPanel p = new JPanel(new BorderLayout(0, 10));
+                JPanel head = new JPanel(new BorderLayout(12, 4));
+                JLabel title = new JLabel(s.label());
+                title.setFont(title.getFont().deriveFont(Font.BOLD, 20f));
+                title.setForeground(INK);
+                head.add(title, BorderLayout.NORTH);
+                String facts = s.days() == 1
+                        ? String.format(Locale.ROOT, "In the top 10 on one run, %s, at rank #%d.", s.first().format(D), s.bestRank())
+                        : String.format(Locale.ROOT, "In the top 10 on %d runs between %s and %s; best rank #%d.",
+                        s.days(), s.first().format(D), s.last().format(D), s.bestRank());
+                List<Pred> graded = ps.stream().filter(Pred::graded).toList();
+                if (ps.isEmpty())
+                    facts += " No predictions were made about it (only the top " + PREDICTED_STORIES + " stories get them).";
+                else if (graded.isEmpty())
+                    facts += String.format(Locale.ROOT, " %d prediction%s, none graded yet.", ps.size(), ps.size() == 1 ? "" : "s");
+                else
+                    facts += String.format(Locale.ROOT, " %d predictions, %d graded: %d came true (%.0f%%) against an "
+                            + "average forecast of %.0f%%; Brier score %.3f.", ps.size(), graded.size(), s.hits(),
+                            100.0 * s.hits() / graded.size(), 100 * graded.stream().mapToDouble(Pred::p).average().orElse(0),
+                            brier(graded, Pred::p));
+                head.add(wrapped(facts, INK), BorderLayout.CENTER);
+                if (!ps.isEmpty()) {
+                    JButton open = new JButton("Show its predictions");
+                    open.setToolTipText("Open the Predictions tab filtered to this story");
+                    open.addActionListener(e -> gui.showInLedger(s.label()));
+                    JPanel bp = new JPanel(new BorderLayout());
+                    bp.add(open, BorderLayout.NORTH);
+                    head.add(bp, BorderLayout.EAST);
+                }
+                p.add(head, BorderLayout.NORTH);
+                p.add(card(new StoryTimeline(s, history, ps)), BorderLayout.CENTER);
+                Gui.show(detail, p);
+            }
+        }
+
+        /**
+         * One story over time, in three bands that share a date axis: its share of headlines, its rank (top 5
+         * shaded), and the predictions made about it, one lane per type, each marked at its due date.
+         */
+        @SuppressWarnings("serial")
+        static final class StoryTimeline extends JComponent {
+            final StoryStat s;
+            final Map<LocalDate, HistRow> rows = new HashMap<>();
+            final List<LocalDate> runs;           // every run date in range, whether or not the story was in the top 10
+            final List<Pred> preds;
+            final List<String> lanes;
+            final LocalDate from, to, lastRun;
+            final List<Object[]> hits = new ArrayList<>(); // {x, y, tooltip}
+
+            StoryTimeline(StoryStat s, List<HistRow> history, List<Pred> preds) {
+                this.s = s;
+                this.preds = preds;
+                for (HistRow r : history) if (r.term().equals(s.term())) rows.put(r.date(), r);
+                lastRun = history.stream().map(HistRow::date).max(Comparator.naturalOrder()).orElse(s.last());
+                LocalDate start = s.first().minusDays(1);
+                LocalDate end = preds.stream().map(Pred::due).max(Comparator.naturalOrder()).orElse(s.last());
+                if (end.isBefore(s.last())) end = s.last();
+                LocalDate endPad = end.plusDays(1);
+                this.from = start;
+                this.to = endPad;
+                runs = history.stream().map(HistRow::date).filter(d -> !d.isBefore(start) && !d.isAfter(endPad))
+                        .distinct().sorted().toList();
+                lanes = preds.stream().map(Pred::key).distinct().sorted().toList();
+                setPreferredSize(new Dimension(620, 520));
+                setToolTipText("");
+            }
+
+            @Override public String getToolTipText(java.awt.event.MouseEvent e) {
+                Object[] best = null;
+                double bd = 9;
+                for (Object[] h : hits) {
+                    double d = Math.hypot(e.getX() - (double) h[0], e.getY() - (double) h[1]);
+                    if (d < bd) { bd = d; best = h; }
+                }
+                return best == null ? null : (String) best[2];
+            }
+
+            static String laneLabel(String key) {
+                String[] k = key.split("@");
+                String what = switch (k[0]) {
+                    case "TOP5" -> "Top 5";
+                    case "SHARE_UP" -> "Share up";
+                    case "TONE_PERSIST" -> "Tone holds";
+                    default -> k[0];
+                };
+                return what + " · " + (k.length > 1 ? k[1] : "?") + "d";
+            }
+
+            @Override protected void paintComponent(Graphics g0) {
+                Graphics2D g = smooth(g0);
+                int w = getWidth(), h = getHeight();
+                Font small = UIManager.getFont("Label.font").deriveFont(11f);
+                Font bold = small.deriveFont(Font.BOLD, 12.5f);
+                hits.clear();
+
+                int left = 92, right = 24, top = 40, bottom = 30, gap = 44;   // band titles sit above each band
+                int laneH = 24, lanesH = Math.max(1, lanes.size()) * laneH;
+                int avail = h - top - bottom - lanesH - 2 * gap - 20;
+                int shareH = (int) (avail * 0.6), rankH = avail - shareH;
+                int x0 = left, x1 = w - right;
+                int sTop = top, sBot = sTop + shareH;
+                int rTop = sBot + gap, rBot = rTop + rankH;
+                int lTop = rBot + gap + 20, lBot = lTop + lanesH;
+                long span = Math.max(1, ChronoUnit.DAYS.between(from, to));
+                java.util.function.ToDoubleFunction<LocalDate> X =
+                        d -> x0 + (x1 - x0) * (double) ChronoUnit.DAYS.between(from, d) / span;
+
+                // future (after the latest run): predictions there are still pending
+                if (lastRun.isBefore(to)) {
+                    int xl = (int) X.applyAsDouble(lastRun);
+                    g.setColor(new Color(0xf6f7f9));
+                    g.fillRect(xl, sTop - 8, x1 - xl, lBot - sTop + 8);
+                    g.setColor(AXIS);
+                    g.setStroke(DASHED);
+                    g.drawLine(xl, sTop - 8, xl, lBot);
+                    g.setStroke(new BasicStroke(1f));
+                    g.setColor(MUTED);
+                    g.setFont(small);
+                    g.drawString("latest run", xl + 4, sTop - 12 + 10);
+                }
+
+                // ---- band 1: share of headlines
+                double maxShare = rows.values().stream().mapToDouble(HistRow::share).max().orElse(0.1);
+                double ymax = Math.min(1, Math.max(0.1, Math.ceil(maxShare * 1.15 / 0.1) * 0.1));
+                java.util.function.DoubleUnaryOperator YS = v -> sBot - (sBot - sTop) * v / ymax;
+                g.setFont(bold);
+                g.setColor(INK);
+                g.drawString("Share of headlines", 12, sTop - 16);
+                g.setFont(small);
+                g.setColor(MUTED);
+                g.drawString("Dots: runs where it was in the top 10. Ticks on the axis: runs where it was not.",
+                        12 + g.getFontMetrics(bold).stringWidth("Share of headlines") + 14, sTop - 16);
+                double step = ymax > 0.5 ? 0.2 : 0.1;
+                for (double t = 0; t <= ymax + 1e-9; t += step) {
+                    int y = (int) YS.applyAsDouble(t);
+                    g.setColor(GRID);
+                    g.drawLine(x0, y, x1, y);
+                    g.setColor(MUTED);
+                    textRight(g, String.format(Locale.ROOT, "%.0f%%", t * 100), x0 - 6, y + 4);
+                }
+                plotSeries(g, X, d -> YS.applyAsDouble(rows.get(d).share()), sBot,
+                        d -> String.format(Locale.ROOT, "%s: %.0f%% of headlines (%d of %d), rank #%d", d.format(DAY),
+                                rows.get(d).share() * 100, rows.get(d).count(), rows.get(d).total(), rows.get(d).rank()));
+
+                // ---- band 2: rank (1 at the top), top 5 shaded
+                java.util.function.DoubleUnaryOperator YR = r -> rTop + (rBot - rTop) * (r - 1) / 9.0;
+                g.setFont(bold);
+                g.setColor(INK);
+                g.drawString("Rank", 12, rTop - 16);
+                g.setFont(small);
+                g.setColor(new Color(0xeef3fd));
+                g.fillRect(x0, (int) YR.applyAsDouble(0.5), x1 - x0, (int) (YR.applyAsDouble(5.5) - YR.applyAsDouble(0.5)));
+                g.setColor(new Color(0x7a96d6));
+                g.drawString("top 5", x0 + 6, (int) YR.applyAsDouble(1) + 4);
+                for (int r : new int[]{1, 5, 10}) {
+                    int y = (int) YR.applyAsDouble(r);
+                    g.setColor(GRID);
+                    g.drawLine(x0, y, x1, y);
+                    g.setColor(MUTED);
+                    textRight(g, "#" + r, x0 - 6, y + 4);
+                }
+                plotSeries(g, X, d -> YR.applyAsDouble(rows.get(d).rank()), rBot + 6,
+                        d -> String.format(Locale.ROOT, "%s: rank #%d", d.format(DAY), rows.get(d).rank()));
+
+                // ---- band 3: predictions, one lane per type, marked at the due date
+                g.setFont(bold);
+                g.setColor(INK);
+                g.drawString("Predictions (at due date)", 8, lTop - 12);
+                g.setFont(small);
+                int lx = x1;
+                String[][] legend = {{"void", "V"}, {"pending", "P"}, {"didn't happen", "F"}, {"came true", "T"}};
+                for (String[] it : legend) {
+                    int tw = g.getFontMetrics().stringWidth(it[0]);
+                    lx -= tw;
+                    g.setColor(MUTED);
+                    g.drawString(it[0], lx, lTop - 12);
+                    lx -= 14;
+                    marker(g, it[1], lx + 5, lTop - 16);
+                    lx -= 14;
+                }
+                if (lanes.isEmpty()) {
+                    g.setColor(MUTED);
+                    g.drawString("No predictions were made about this story.", x0, lTop + 16);
+                }
+                for (int i = 0; i < lanes.size(); i++) {
+                    int y = lTop + i * laneH + laneH / 2;
+                    g.setColor(GRID);
+                    g.drawLine(x0, y, x1, y);
+                    g.setColor(INK);
+                    textRight(g, laneLabel(lanes.get(i)), x0 - 8, y + 4);
+                    for (Pred p : preds) {
+                        if (!p.key().equals(lanes.get(i))) continue;
+                        double x = X.applyAsDouble(p.due());
+                        String code = switch (p.outcome()) {
+                            case "TRUE" -> "T";
+                            case "FALSE" -> "F";
+                            case "VOID" -> "V";
+                            default -> "P";
+                        };
+                        marker(g, code, (int) x, y);
+                        hits.add(new Object[]{x, (double) y, "<html><b>" + escape(statement(p)) + "</b><br>Forecast "
+                                + pct(p.p()) + (Math.abs(p.p() - p.pRaw()) > 1e-9 ? " (before recalibration "
+                                + pct(p.pRaw()) + ")" : "") + " · made " + p.made().format(DAY) + "<br>"
+                                + outcomeText(p) + (p.graded() ? " (graded " + resolvedOn(p).format(DAY) + ")" : "")
+                                + "</html>"});
+                    }
+                }
+
+                // ---- shared date axis
+                int every = Math.max(1, (int) Math.ceil(span / 9.0));
+                DateTimeFormatter f = DateTimeFormatter.ofPattern("d MMM", Locale.UK);
+                g.setFont(small);
+                for (long d = 0; d <= span; d += every) {
+                    LocalDate day = from.plusDays(d);
+                    int x = (int) X.applyAsDouble(day);
+                    g.setColor(MUTED);
+                    textCentre(g, day.format(f), x, lBot + 18);
+                    g.setColor(GRID);
+                    g.drawLine(x, lBot + 2, x, lBot + 6);
+                }
+                g.dispose();
+            }
+
+            /**
+             * Dots for days the story was in the top 10, joined where the runs were consecutive; a small grey tick
+             * at the band's foot for runs where it was outside the top 10.
+             */
+            void plotSeries(Graphics2D g, java.util.function.ToDoubleFunction<LocalDate> X,
+                            java.util.function.ToDoubleFunction<LocalDate> Y, int foot,
+                            java.util.function.Function<LocalDate, String> tip) {
+                g.setColor(CASSANDRA);
+                g.setStroke(new BasicStroke(2f));
+                for (int i = 1; i < runs.size(); i++) {
+                    LocalDate a = runs.get(i - 1), b = runs.get(i);
+                    if (rows.containsKey(a) && rows.containsKey(b))
+                        g.draw(new java.awt.geom.Line2D.Double(X.applyAsDouble(a), Y.applyAsDouble(a),
+                                X.applyAsDouble(b), Y.applyAsDouble(b)));
+                }
+                g.setStroke(new BasicStroke(1f));
+                for (LocalDate d : runs) {
+                    double x = X.applyAsDouble(d);
+                    if (rows.containsKey(d)) {
+                        double y = Y.applyAsDouble(d);
+                        g.setColor(CASSANDRA);
+                        g.fill(new java.awt.geom.Ellipse2D.Double(x - 3.5, y - 3.5, 7, 7));
+                        hits.add(new Object[]{x, y, tip.apply(d)});
+                    } else {
+                        g.setColor(AXIS);
+                        g.drawLine((int) x, foot - 4, (int) x, foot + 2);
+                        hits.add(new Object[]{x, (double) foot, d.format(DAY) + ": not in the top 10"});
+                    }
+                }
+            }
+
+            /** T came true (filled green), F didn't happen (red cross), P pending (hollow), V void (grey dash). */
+            static void marker(Graphics2D g, String code, int x, int y) {
+                switch (code) {
+                    case "T" -> {
+                        g.setColor(GOOD);
+                        g.fillOval(x - 5, y - 5, 10, 10);
+                    }
+                    case "F" -> {
+                        g.setColor(BAD);
+                        g.setStroke(new BasicStroke(2.2f));
+                        g.drawLine(x - 4, y - 4, x + 4, y + 4);
+                        g.drawLine(x - 4, y + 4, x + 4, y - 4);
+                        g.setStroke(new BasicStroke(1f));
+                    }
+                    case "V" -> {
+                        g.setColor(AXIS);
+                        g.setStroke(new BasicStroke(2f));
+                        g.drawLine(x - 4, y, x + 4, y);
+                        g.setStroke(new BasicStroke(1f));
+                    }
+                    default -> {
+                        g.setColor(Color.WHITE);
+                        g.fillOval(x - 5, y - 5, 10, 10);
+                        g.setColor(MUTED);
+                        g.setStroke(new BasicStroke(1.5f));
+                        g.drawOval(x - 5, y - 5, 10, 10);
+                        g.setStroke(new BasicStroke(1f));
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- Predictions tab
+
+        static String outcomeText(Pred p) {
+            return switch (p.outcome()) {
+                case "TRUE" -> "Came true";
+                case "FALSE" -> "Didn't happen";
+                case "VOID" -> "Void";
+                default -> "Pending";
+            };
+        }
+
+        /** What a prediction claims, without its date (the table has a Due column). */
+        static String claim(Pred p) {
+            return switch (p.kind()) {
+                case "TOP5" -> "Still in the top 5";
+                case "SHARE_UP" -> "Bigger share than "
+                        + String.format(Locale.ROOT, "%.0f%%", Double.parseDouble(p.param()) * 100);
+                case "TONE_PERSIST" -> "Coverage still " + (p.param().equals("NEG") ? "negative" : "positive");
+                default -> p.kind();
+            };
+        }
+
+        /**
+         * Every prediction Cassandra has made, in a sortable, filterable, read-only table. It is built once
+         * and given fresh data on each reload, so filters, sorting and scroll position survive a scheduled run.
+         */
+        @SuppressWarnings("serial")
+        static final class Ledger extends JPanel {
+            static final String[] COLS = {"Made", "Due", "Story", "Prediction", "Type", "Forecast", "Before recal.",
+                    "Outcome", "Graded"};
+            static final List<String> OUTCOMES = List.of("Pending", "Came true", "Didn't happen", "Void");
+            static final DateTimeFormatter D = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.UK);
+
+            final JFrame owner;
+            List<Pred> rows = new ArrayList<>();
+            final List<String> typeKeys = new ArrayList<>();   // parallel to the type box, after "All types"
+            final javax.swing.table.AbstractTableModel model = new javax.swing.table.AbstractTableModel() {
+                @Override public int getRowCount() { return rows.size(); }
+                @Override public int getColumnCount() { return COLS.length; }
+                @Override public String getColumnName(int c) { return COLS[c]; }
+                @Override public Class<?> getColumnClass(int c) {
+                    return switch (c) {
+                        case 0, 1, 8 -> LocalDate.class;
+                        case 5, 6 -> Double.class;
+                        default -> String.class;
+                    };
+                }
+                @Override public Object getValueAt(int r, int c) {
+                    Pred p = rows.get(r);
+                    return switch (c) {
+                        case 0 -> p.made();
+                        case 1 -> p.due();
+                        case 2 -> p.label();
+                        case 3 -> claim(p);
+                        case 4 -> p.key();
+                        case 5 -> p.p();
+                        case 6 -> p.pRaw();
+                        case 7 -> outcomeText(p);
+                        default -> p.graded() || p.outcome().equals("VOID") ? resolvedOn(p) : null;
+                    };
+                }
+            };
+            final JTable table = new JTable(model) {
+                @Override public String getToolTipText(java.awt.event.MouseEvent e) {
+                    int r = rowAtPoint(e.getPoint());
+                    return r < 0 ? null : statement(rows.get(convertRowIndexToModel(r)));
+                }
+            };
+            final javax.swing.table.TableRowSorter<javax.swing.table.TableModel> sorter =
+                    new javax.swing.table.TableRowSorter<>(model);
+            final JComboBox<String> status = new JComboBox<>();
+            final JComboBox<String> type = new JComboBox<>();
+            final JTextField search = new JTextField(18);
+            final JTextArea summary = wrapped(" ", INK);
+            final java.awt.CardLayout cards = new java.awt.CardLayout();
+            final JPanel body = new JPanel(cards);
+
+            Ledger(JFrame owner) {
+                this.owner = owner;
+                setLayout(new BorderLayout(0, 10));
+                setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+                status.addItem("All outcomes");
+                OUTCOMES.forEach(status::addItem);
+                type.addItem("All types");
+                JButton export = new JButton("Export CSV…");
+                export.addActionListener(e -> chooseAndExport());
+                JButton clear = new JButton("Clear filters");
+                clear.addActionListener(e -> {
+                    status.setSelectedIndex(0);
+                    type.setSelectedIndex(0);
+                    search.setText("");
+                });
+
+                JPanel filters = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+                filters.add(new JLabel("Show:"));
+                filters.add(status);
+                filters.add(type);
+                filters.add(new JLabel("Search:"));
+                search.setToolTipText("Matches the story, the prediction or its type");
+                filters.add(search);
+                filters.add(clear);
+                JPanel bar = new JPanel(new BorderLayout());
+                bar.add(filters, BorderLayout.WEST);
+                bar.add(export, BorderLayout.EAST);
+
+                JPanel head = new JPanel(new BorderLayout(0, 8));
+                head.add(bar, BorderLayout.NORTH);
+                summary.setFont(summary.getFont().deriveFont(13f));
+                head.add(summary, BorderLayout.CENTER);
+                add(head, BorderLayout.NORTH);
+
+                // table
+                table.setRowSorter(sorter);
+                table.setRowHeight(24);
+                table.setShowVerticalLines(false);
+                table.setGridColor(GRID);
+                table.setAutoCreateRowSorter(false);
+                table.getTableHeader().setReorderingAllowed(false);
+                int[] widths = {92, 92, 140, 230, 120, 70, 90, 100, 92};
+                for (int c = 0; c < widths.length; c++) table.getColumnModel().getColumn(c).setPreferredWidth(widths[c]);
+                sorter.setComparator(7, Comparator.comparingInt((String s) -> OUTCOMES.indexOf(s)));
+                sorter.setSortKeys(List.of(new RowSorter.SortKey(0, SortOrder.DESCENDING),
+                        new RowSorter.SortKey(2, SortOrder.ASCENDING)));
+                javax.swing.table.DefaultTableCellRenderer cell = new javax.swing.table.DefaultTableCellRenderer() {
+                    @Override public Component getTableCellRendererComponent(JTable t, Object v, boolean sel,
+                                                                             boolean focus, int r, int c) {
+                        Object shown = v instanceof LocalDate d ? d.format(D)
+                                : v instanceof Double x ? String.format(Locale.ROOT, "%.0f%%", x * 100)
+                                : v == null ? "" : v;
+                        Component comp = super.getTableCellRendererComponent(t, shown, sel, focus, r, c);
+                        setHorizontalAlignment(v instanceof Double ? SwingConstants.RIGHT : SwingConstants.LEFT);
+                        setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 10));
+                        if (!sel) {
+                            Pred p = rows.get(t.convertRowIndexToModel(r));
+                            comp.setForeground(c == 7 ? (p.outcome().equals("TRUE") ? GOOD
+                                    : p.outcome().equals("FALSE") ? BAD : MUTED)
+                                    : c == 6 && Math.abs(p.p() - p.pRaw()) < 1e-9 ? MUTED : INK);
+                        }
+                        return comp;
+                    }
+                };
+                for (int c = 0; c < COLS.length; c++) table.getColumnModel().getColumn(c).setCellRenderer(cell);
+
+                JScrollPane sp = new JScrollPane(table);
+                sp.getViewport().setBackground(Color.WHITE);
+                body.add(sp, "table");
+                body.add(message("No predictions in this folder yet.",
+                        "They appear here after Cassandra's first run."), "empty");
+                add(body, BorderLayout.CENTER);
+                add(wrapped("Hover a row for the prediction in full. Click a column heading to sort; shift-click "
+                        + "to sort by a second column. \"Before recal.\" is grey where recalibration made no change. "
+                        + "Export saves the rows currently shown, in the order shown.", MUTED), BorderLayout.SOUTH);
+
+                status.addActionListener(e -> refilter());
+                type.addActionListener(e -> refilter());
+                search.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+                    @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { refilter(); }
+                    @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { refilter(); }
+                    @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { refilter(); }
+                });
+            }
+
+            /** New data from a reload. Filters, sort order and the chosen type are kept. */
+            void setData(Collection<Pred> preds) {
+                rows = new ArrayList<>(preds);
+                String keepType = type.getSelectedIndex() > 0 ? typeKeys.get(type.getSelectedIndex() - 1) : null;
+                List<String> keys = rows.stream().map(Pred::key).distinct().sorted().toList();
+                if (!keys.equals(typeKeys)) {
+                    typeKeys.clear();
+                    typeKeys.addAll(keys);
+                    type.removeAllItems();
+                    type.addItem("All types");
+                    for (String k : keys) type.addItem(typeLabel(k));
+                    type.setSelectedIndex(keepType == null || !keys.contains(keepType) ? 0 : keys.indexOf(keepType) + 1);
+                }
+                model.fireTableDataChanged();
+                cards.show(body, rows.isEmpty() ? "empty" : "table");
+                refilter();
+            }
+
+            void refilter() {
+                int st = status.getSelectedIndex();
+                String wanted = st <= 0 ? null : OUTCOMES.get(st - 1);
+                int ti = type.getSelectedIndex();
+                String key = ti <= 0 || ti - 1 >= typeKeys.size() ? null : typeKeys.get(ti - 1);
+                String q = search.getText().trim().toLowerCase(Locale.ROOT);
+                sorter.setRowFilter(new RowFilter<>() {
+                    @Override public boolean include(Entry<? extends javax.swing.table.TableModel, ? extends Integer> e) {
+                        Pred p = rows.get(e.getIdentifier());
+                        if (wanted != null && !outcomeText(p).equals(wanted)) return false;
+                        if (key != null && !p.key().equals(key)) return false;
+                        return q.isEmpty() || (p.label() + " " + p.term() + " " + claim(p) + " " + typeLabel(p.key())
+                                + " " + p.key()).toLowerCase(Locale.ROOT).contains(q);
+                    }
+                });
+                summary.setText(summarise(shown()));
+            }
+
+            /** The rows currently visible, in the order shown. */
+            List<Pred> shown() {
+                List<Pred> out = new ArrayList<>();
+                for (int i = 0; i < table.getRowCount(); i++) out.add(rows.get(table.convertRowIndexToModel(i)));
+                return out;
+            }
+
+            String summarise(List<Pred> ps) {
+                if (rows.isEmpty()) return " ";
+                List<Pred> graded = ps.stream().filter(Pred::graded).toList();
+                String s = String.format(Locale.ROOT, "Showing %d of %d predictions.", ps.size(), rows.size());
+                if (graded.isEmpty()) return s + " None of these has been graded yet.";
+                long hits = graded.stream().filter(p -> p.outcome().equals("TRUE")).count();
+                return s + String.format(Locale.ROOT, " Of the %d graded: %d came true (%.0f%%), against an average "
+                        + "forecast of %.0f%%. Brier score %.3f (a coin flip scores 0.250).", graded.size(), hits,
+                        100.0 * hits / graded.size(), 100 * graded.stream().mapToDouble(Pred::p).average().orElse(0),
+                        brier(graded, Pred::p));
+            }
+
+            void chooseAndExport() {
+                JFileChooser fc = new JFileChooser();
+                fc.setSelectedFile(new java.io.File(System.getProperty("user.home"), "cassandra-predictions.csv"));
+                if (fc.showSaveDialog(owner) != JFileChooser.APPROVE_OPTION) return;
+                Path target = fc.getSelectedFile().toPath();
+                if (Files.exists(target) && JOptionPane.showConfirmDialog(owner, target.getFileName()
+                        + " already exists. Replace it?", "Export CSV", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION)
+                    return;
+                try {
+                    int n = exportCsv(target, shown());
+                    JOptionPane.showMessageDialog(owner, "Saved " + n + " predictions to\n" + target);
+                } catch (IOException ex) {
+                    JOptionPane.showMessageDialog(owner, "Couldn't save " + target + "\n" + ex.getMessage(),
+                            "Export CSV", JOptionPane.ERROR_MESSAGE);
+                }
+            }
+
+            /** Write predictions as CSV (RFC 4180 quoting). Returns how many were written. */
+            static int exportCsv(Path target, List<Pred> ps) throws IOException {
+                List<String> lines = new ArrayList<>();
+                lines.add("id,made,due,story,term,type,claim,statement,probability,probability_before_recalibration,"
+                        + "outcome,graded_on");
+                for (Pred p : ps)
+                    lines.add(String.join(",", csv(p.id()), p.made().toString(), p.due().toString(), csv(p.label()),
+                            csv(p.term()), csv(p.key()), csv(claim(p)), csv(statement(p)),
+                            String.format(Locale.ROOT, "%.4f", p.p()), String.format(Locale.ROOT, "%.4f", p.pRaw()),
+                            csv(outcomeText(p)), p.resolved().equals("-") ? "" : p.resolved()));
+                Files.write(target, lines, StandardCharsets.UTF_8);
+                return ps.size();
+            }
+
+            static String csv(String s) {
+                return s.contains(",") || s.contains("\"") || s.contains("\n") ? "\"" + s.replace("\"", "\"\"") + "\"" : s;
+            }
         }
 
         // ---------------------------------------------------------------- small helpers
@@ -2652,7 +3727,7 @@ public class Cassandra {
             JOptionPane.showMessageDialog(frame, text, "About Cassandra", JOptionPane.INFORMATION_MESSAGE);
         }
 
-        static void open(Path dir) {
+        static void open(Path dir, boolean demo) {
             if (GraphicsEnvironment.isHeadless()) {
                 System.out.println("--gui needs a display. Run it on your desktop, or use --report in a terminal.");
                 return;
@@ -2662,8 +3737,752 @@ public class Cassandra {
             SwingUtilities.invokeLater(() -> {
                 try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); }
                 catch (Exception ignored) { /* keep the default look */ }
-                new Gui(dir).frame.setVisible(true);
+                new Gui(dir, demo).frame.setVisible(true);
             });
+        }
+
+        static JComponent section(String title, JComponent body) {
+            JPanel p = new JPanel(new BorderLayout(0, 8));
+            p.setBackground(Color.WHITE);
+            p.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(GRID),
+                    BorderFactory.createEmptyBorder(12, 16, 12, 16)));
+            JLabel h = new JLabel(title);
+            h.setFont(h.getFont().deriveFont(Font.BOLD, 14f));
+            h.setForeground(INK);
+            p.add(h, BorderLayout.NORTH);
+            transparent(body);
+            p.add(body, BorderLayout.CENTER);
+            return p;
+        }
+
+        /** Let a card's white show through its inner layout panels. */
+        static void transparent(JComponent c) {
+            if (c instanceof JPanel || c instanceof JRadioButton) c.setOpaque(false);
+            for (Component k : c.getComponents()) if (k instanceof JComponent j && !(k instanceof JScrollPane)) transparent(j);
+        }
+
+        // ---------------------------------------------------------------- Run tab
+
+        /** Sends text printed during a run, line by line, to a consumer (the Run tab's log). */
+        static final class LineSink extends java.io.OutputStream {
+            final java.util.function.Consumer<String> to;
+            final java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+
+            LineSink(java.util.function.Consumer<String> to) { this.to = to; }
+
+            @Override public synchronized void write(int b) {
+                if (b == '\n') flushLine(); else buf.write(b);
+            }
+
+            synchronized void flushLine() {
+                to.accept(buf.toString(StandardCharsets.UTF_8));
+                buf.reset();
+            }
+        }
+
+        /**
+         * Run Cassandra from the window: today's run on live feeds, or demo days, plus a health check of the
+         * folder's run history. Runs happen in the background and print to the log here.
+         */
+        @SuppressWarnings("serial")
+        static final class RunPanel extends JPanel {
+            final Gui gui;
+            final JRadioButton live = new JRadioButton("Live news");
+            final JRadioButton demo = new JRadioButton("Demo headlines (offline)");
+            final JTextArea modeNote = wrapped(" ", MUTED);
+            final JButton runNow = new JButton("Run now");
+            final JButton simulate = new JButton("Simulate");
+            final JSpinner days = new JSpinner(new SpinnerNumberModel(35, 1, 120, 1));
+            final JLabel daysLabel = new JLabel("days");
+            final JPanel simGroup = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));   // demo mode only
+            final JButton stop = new JButton("Stop");
+            final JProgressBar progress = new JProgressBar();
+            final JTextArea health = wrapped(" ", INK);
+            final JTextArea log = new JTextArea();
+            volatile boolean stopRequested;
+            boolean running;
+            Path dir;
+            List<HistRow> history = List.of();
+
+            RunPanel(Gui gui) {
+                this.gui = gui;
+                setLayout(new BorderLayout(0, 12));
+                setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+                ButtonGroup g = new ButtonGroup();
+                g.add(live);
+                g.add(demo);
+                live.addActionListener(e -> gui.setDemoMode(false));
+                demo.addActionListener(e -> gui.setDemoMode(true));
+                JPanel modes = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
+                modes.add(new JLabel("Headlines from:"));
+                modes.add(live);
+                modes.add(demo);
+
+                runNow.addActionListener(e -> start(gui.demoMode ? List.of(nextDemoDay())
+                        : List.of(LocalDate.now(ZoneOffset.UTC)), true));
+                simulate.addActionListener(e -> {
+                    List<LocalDate> ds = new ArrayList<>();
+                    LocalDate d = nextDemoDay();
+                    for (int i = 0; i < (Integer) days.getValue(); i++) ds.add(d.plusDays(i));
+                    start(ds, false);
+                });
+                stop.addActionListener(e -> {
+                    stopRequested = true;
+                    stop.setEnabled(false);
+                    append("Stopping after the current day…");
+                });
+                stop.setEnabled(false);
+                progress.setStringPainted(true);
+                progress.setString("Idle");
+                JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+                buttons.add(runNow);
+                simGroup.add(simulate);
+                simGroup.add(days);
+                simGroup.add(daysLabel);
+                buttons.add(simGroup);
+                buttons.add(stop);
+                modes.setOpaque(false);
+                buttons.setOpaque(false);
+                live.setOpaque(false);
+                demo.setOpaque(false);
+                JPanel controls = new JPanel(new BorderLayout(0, 8));
+                controls.add(modes, BorderLayout.NORTH);
+                controls.add(modeNote, BorderLayout.CENTER);
+                JPanel row = new JPanel(new BorderLayout(0, 8));
+                row.setOpaque(false);
+                row.add(buttons, BorderLayout.NORTH);
+                row.add(progress, BorderLayout.SOUTH);
+                controls.add(row, BorderLayout.SOUTH);
+
+                JPanel top = new JPanel(new GridLayout(1, 2, 12, 0));
+                top.add(section("Run Cassandra", controls));
+                top.add(section("Run health", health));
+                add(top, BorderLayout.NORTH);
+
+                log.setEditable(false);
+                log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+                log.setMargin(new Insets(8, 10, 8, 10));
+                ((javax.swing.text.DefaultCaret) log.getCaret()).setUpdatePolicy(javax.swing.text.DefaultCaret.ALWAYS_UPDATE);
+                JScrollPane sp = new JScrollPane(log);
+                JButton clear = new JButton("Clear log");
+                clear.addActionListener(e -> log.setText(""));
+                JPanel logHead = new JPanel(new BorderLayout());
+                JLabel lh = new JLabel("Log");
+                lh.setFont(lh.getFont().deriveFont(Font.BOLD, 14f));
+                logHead.add(lh, BorderLayout.WEST);
+                logHead.add(clear, BorderLayout.EAST);
+                JPanel logPanel = new JPanel(new BorderLayout(0, 6));
+                logPanel.add(logHead, BorderLayout.NORTH);
+                logPanel.add(sp, BorderLayout.CENTER);
+                add(logPanel, BorderLayout.CENTER);
+                updateMode();
+            }
+
+            void updateMode() {
+                live.setSelected(!gui.demoMode);
+                demo.setSelected(gui.demoMode);
+                boolean d = gui.demoMode;
+                runNow.setText(d ? "Run next demo day" : "Run now");
+                simGroup.setVisible(d);
+                modeNote.setText(d
+                        ? "Demo mode uses synthetic headlines and its own folder ("
+                        + gui.demoDir.toAbsolutePath().normalize() + "), so it never touches your real track record. "
+                        + "Each run is the next day of the demo storyline."
+                        : "Fetches today's headlines from your feeds (see Settings) and runs exactly as a scheduled run "
+                        + "would, saving to " + gui.liveDir.toAbsolutePath().normalize() + ". Running again on the same "
+                        + "day replaces that day's history; predictions already made today are kept.");
+            }
+
+            /** The day after the demo folder's latest run, or the start of the demo storyline. */
+            LocalDate nextDemoDay() {
+                return history.stream().map(HistRow::date).max(Comparator.naturalOrder())
+                        .map(d -> d.plusDays(1)).orElse(DEMO_START);
+            }
+
+            void setData(Path dir, List<HistRow> history, Collection<Pred> preds) {
+                this.dir = dir;
+                this.history = history;
+                updateMode();
+                health.setText(healthText(history, preds));
+            }
+
+            String healthText(List<HistRow> history, Collection<Pred> preds) {
+                if (history.isEmpty())
+                    return "No runs recorded in this folder yet." + (gui.demoMode
+                            ? " Run next demo day starts the storyline on " + DEMO_START.format(LONG_DAY) + "."
+                            : " Press Run now, or set up a scheduled job (see the README).");
+                TreeSet<LocalDate> runs = new TreeSet<>();
+                for (HistRow r : history) runs.add(r.date());
+                LocalDate last = runs.last();
+                long voided = preds.stream().filter(p -> p.outcome().equals("VOID")).count();
+                long settled = preds.stream().filter(p -> !p.outcome().equals("PENDING")).count();
+                StringBuilder s = new StringBuilder();
+                if (gui.demoMode) {
+                    s.append("Latest demo day: ").append(last.format(LONG_DAY)).append(". Next run: ")
+                            .append(last.plusDays(1).format(LONG_DAY)).append(".");
+                } else {
+                    LocalDate today = LocalDate.now(ZoneOffset.UTC);
+                    long age = ChronoUnit.DAYS.between(last, today);
+                    s.append("Latest run: ").append(last.format(LONG_DAY)).append(age == 0 ? " (today)."
+                            : age == 1 ? " (yesterday)." : age > 1 ? " (" + age + " days ago)." : ".");
+                    // missed days: from the first run to yesterday (today may not have run yet), last 30 days
+                    LocalDate end = runs.contains(today) ? today : today.minusDays(1);
+                    LocalDate start = runs.first().isAfter(end.minusDays(29)) ? runs.first() : end.minusDays(29);
+                    List<LocalDate> missed = new ArrayList<>();
+                    for (LocalDate d = start; !d.isAfter(end); d = d.plusDays(1)) if (!runs.contains(d)) missed.add(d);
+                    if (missed.isEmpty())
+                        s.append(" No missed days in the last 30.");
+                    else {
+                        s.append(" Missed ").append(missed.size()).append(missed.size() == 1 ? " day" : " days")
+                                .append(" in the last 30: ");
+                        s.append(String.join(", ", missed.stream().limit(10).map(d -> d.format(DAY)).toList()));
+                        if (missed.size() > 10) s.append(" and ").append(missed.size() - 10).append(" more");
+                        s.append(". Check your scheduled job.");
+                    }
+                }
+                s.append(String.format(Locale.ROOT, "%n%nRuns recorded: %d, from %s.", runs.size(), runs.first().format(DAY)));
+                int archived = archiveFiles(dir).size();
+                s.append(archived == 0 ? " No archived headlines yet (runs archive them from version 2.0 on)."
+                        : " Days of headlines archived for replay: " + archived + ".");
+                if (settled > 0)
+                    s.append(String.format(Locale.ROOT, " Predictions voided because no run graded them within %d "
+                            + "days of falling due: %d of %d settled.", GRACE_DAYS, voided, settled));
+                return s.toString();
+            }
+
+            void append(String line) {
+                log.append(line + "\n");
+            }
+
+            void setRunning(boolean on) {
+                lockControls(on);
+                stop.setEnabled(on);
+                gui.settingsPanel.setRunning(on);
+            }
+
+            /** Disable everything that starts a run or changes folder (also used while a replay test runs). */
+            void lockControls(boolean on) {
+                running = on;
+                runNow.setEnabled(!on);
+                simulate.setEnabled(!on);
+                days.setEnabled(!on);
+                live.setEnabled(!on);
+                demo.setEnabled(!on);
+                gui.choose.setEnabled(!on);
+            }
+
+            /**
+             * Run one day per date, in the background. verbose prints the full report (as on the command line);
+             * otherwise each day gets a one-line summary.
+             */
+            void start(List<LocalDate> dates, boolean verbose) {
+                if (running) return;
+                boolean isDemo = gui.demoMode;
+                Path target = gui.dir;
+                stopRequested = false;
+                setRunning(true);
+                progress.setIndeterminate(dates.size() == 1);
+                progress.setMaximum(dates.size());
+                progress.setValue(0);
+                progress.setString(dates.size() == 1 ? "Running…" : "Day 0 of " + dates.size());
+                append((isDemo ? "=== Demo " : "=== Live ") + (dates.size() == 1 ? "run for " + dates.get(0).format(LONG_DAY)
+                        : dates.size() + " days from " + dates.get(0).format(DAY)) + ", saving to "
+                        + target.toAbsolutePath().normalize() + " ===");
+
+                new SwingWorker<Integer, String>() {
+                    @Override protected Integer doInBackground() {
+                        java.io.PrintStream original = System.out;
+                        java.io.PrintStream tee = new java.io.PrintStream(new LineSink(this::publish), true,
+                                StandardCharsets.UTF_8);
+                        System.setOut(tee);
+                        int done = 0;
+                        try {
+                            loadSettings(target).apply();
+                            for (LocalDate d : dates) {
+                                if (stopRequested) break;
+                                TODAY = d;
+                                NOW = isDemo ? d.atTime(12, 0).toInstant(ZoneOffset.UTC) : Instant.now();
+                                FORMS.clear();   // as in a fresh run: labels come from this run's headlines only
+                                List<Article> articles = isDemo ? demoArticles()
+                                        : fetchAll(loadSettings(target).feeds());
+                                articles = dedupe(articles);
+                                if (articles.size() < MIN_ARTICLES) {
+                                    System.out.println(d.format(DAY) + ": only " + articles.size() + " headlines, "
+                                            + "not enough to run (needs " + MIN_ARTICLES + "). Nothing saved.");
+                                } else if (verbose) {
+                                    report(articles, target, true);
+                                } else {
+                                    RunResult r = forecastRun(articles, target, true);
+                                    System.out.println(r == null ? d.format(DAY) + ": no story had enough coverage."
+                                            : String.format(Locale.ROOT, "%s: %d headlines, top story \"%s\"; %d new "
+                                            + "predictions, %d graded today.", d.format(DAY), r.headlines(),
+                                            r.lead().label(), r.added(), r.gradedNow().size()));
+                                }
+                                done++;
+                                setProgress(Math.min(100, 100 * done / dates.size()));
+                                publish("\u0000" + done);   // progress marker for the bar
+                            }
+                        } catch (BusyException e) {
+                            System.out.println(e.getMessage());
+                        } catch (Exception e) {
+                            System.out.println("The run failed: " + e);
+                        } finally {
+                            tee.flush();
+                            System.setOut(original);
+                            TODAY = LocalDate.now(ZoneOffset.UTC);
+                            NOW = Instant.now();
+                        }
+                        return done;
+                    }
+
+                    @Override protected void process(List<String> lines) {
+                        for (String l : lines) {
+                            if (l.startsWith("\u0000")) {
+                                int n = Integer.parseInt(l.substring(1));
+                                progress.setValue(n);
+                                if (dates.size() > 1) progress.setString("Day " + n + " of " + dates.size());
+                            } else append(l);
+                        }
+                    }
+
+                    @Override protected void done() {
+                        int n;
+                        try { n = get(); } catch (Exception e) { n = 0; }
+                        progress.setIndeterminate(false);
+                        progress.setString(n == dates.size() ? "Finished" : "Stopped after " + n + " of " + dates.size());
+                        append("=== " + (n == dates.size() ? "Finished" : "Stopped") + " ===\n");
+                        setRunning(false);
+                        gui.reload();
+                    }
+                }.execute();
+            }
+        }
+
+        // ---------------------------------------------------------------- Settings tab
+
+        /**
+         * Edit the data folder's cassandra.properties: the feeds and the thresholds. Unsaved edits survive the
+         * automatic reload; saving takes effect from the next run, scheduled ones included.
+         */
+        @SuppressWarnings("serial")
+        static final class SettingsPanel extends JPanel {
+            final Gui gui;
+            final DefaultListModel<String> feeds = new DefaultListModel<>();
+            final JList<String> feedList = new JList<>(feeds);
+            final JTextField newFeed = new JTextField(32);
+            final JSpinner minArticles = new JSpinner(new SpinnerNumberModel(8, 3, 50, 1));
+            final JSpinner predicted = new JSpinner(new SpinnerNumberModel(3, 1, 5, 1));
+            final JSpinner rankPenalty = new JSpinner(new SpinnerNumberModel(0.07, 0.0, 0.2, 0.01));
+            final JSpinner historyDays = new JSpinner(new SpinnerNumberModel(14, 3, 60, 1));
+            final JSpinner calibration = new JSpinner(new SpinnerNumberModel(5, 2, 50, 1));
+            final JSpinner grace = new JSpinner(new SpinnerNumberModel(2, 0, 7, 1));
+            final JButton save = new JButton("Save");
+            final JButton revert = new JButton("Revert");
+            final JButton testArchive = new JButton("Test on archive…");
+            final JLabel state = new JLabel(" ");
+            final JTextArea where = wrapped(" ", MUTED);
+            Path dir;
+            boolean dirty, loading, running;
+
+            SettingsPanel(Gui gui) {
+                this.gui = gui;
+                setLayout(new BorderLayout(0, 12));
+                setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+                // top: where the settings live and what changing them means
+                JPanel head = new JPanel(new BorderLayout(0, 6));
+                JLabel h = new JLabel("Settings for this data folder");
+                h.setFont(h.getFont().deriveFont(Font.BOLD, 18f));
+                h.setForeground(INK);
+                head.add(h, BorderLayout.NORTH);
+                head.add(where, BorderLayout.CENTER);
+                JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+                actions.add(save);
+                actions.add(revert);
+                JButton defaults = new JButton("Restore all defaults");
+                actions.add(defaults);
+                testArchive.setToolTipText("Replay this folder's archived headlines with the saved settings and with "
+                        + "your edits, and compare how well each would have predicted");
+                testArchive.addActionListener(e -> testOnArchive());
+                actions.add(Box.createHorizontalStrut(8));
+                actions.add(testArchive);
+                actions.add(Box.createHorizontalStrut(8));
+                state.setForeground(MUTED);
+                actions.add(state);
+                head.add(actions, BorderLayout.SOUTH);
+                add(head, BorderLayout.NORTH);
+
+                // left: feeds
+                feedList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+                feedList.setVisibleRowCount(10);
+                JButton add = new JButton("Add");
+                JButton remove = new JButton("Remove");
+                JButton test = new JButton("Test selected");
+                JButton defaultFeeds = new JButton("Restore default feeds");
+                add.addActionListener(e -> addFeed());
+                newFeed.addActionListener(e -> addFeed());
+                remove.addActionListener(e -> {
+                    int[] sel = feedList.getSelectedIndices();
+                    for (int i = sel.length - 1; i >= 0; i--) feeds.remove(sel[i]);
+                });
+                test.addActionListener(e -> testFeeds());
+                defaultFeeds.addActionListener(e -> {
+                    feeds.clear();
+                    DEFAULT_FEEDS.forEach(feeds::addElement);
+                });
+                JPanel addRow = new JPanel(new BorderLayout(6, 0));
+                addRow.setOpaque(false);
+                addRow.add(newFeed, BorderLayout.CENTER);
+                addRow.add(add, BorderLayout.EAST);
+                JPanel feedButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+                feedButtons.setOpaque(false);
+                feedButtons.add(remove);
+                feedButtons.add(test);
+                feedButtons.add(defaultFeeds);
+                JPanel feedBody = new JPanel(new BorderLayout(0, 8));
+                feedBody.add(wrapped("RSS 2.0 feeds Cassandra reads on live runs. Paste a feed address and press "
+                        + "Add. Feeds given on the command line take priority over this list.", MUTED), BorderLayout.NORTH);
+                feedBody.add(new JScrollPane(feedList), BorderLayout.CENTER);
+                JPanel feedSouth = new JPanel(new BorderLayout(0, 8));
+                feedSouth.setOpaque(false);
+                feedSouth.add(addRow, BorderLayout.NORTH);
+                feedSouth.add(feedButtons, BorderLayout.SOUTH);
+                feedBody.add(feedSouth, BorderLayout.SOUTH);
+
+                // right: thresholds
+                JPanel th = new JPanel(new java.awt.GridBagLayout());
+                java.awt.GridBagConstraints g = new java.awt.GridBagConstraints();
+                g.anchor = java.awt.GridBagConstraints.NORTHWEST;
+                g.insets = new Insets(6, 0, 6, 10);
+                Object[][] rows = {
+                        {"Headlines needed for a run", minArticles,
+                                "A run with fewer headlines than this stops without saving anything."},
+                        {"Stories that get predictions", predicted,
+                                "How many of the day's leading stories get predictions (1 to 5)."},
+                        {"Rank penalty", rankPenalty,
+                                "How much lower the starting \"still in the top 5\" probability is for each rank below first."},
+                        {"Trend look-back (days)", historyDays, "How many days of history the coverage trend is fitted over."},
+                        {"Results before recalibrating", calibration,
+                                "Graded results a prediction type needs before its probabilities are corrected."},
+                        {"Grace period (days)", grace,
+                                "How long after its due date a prediction can still be graded. After that it is voided."}};
+                for (int i = 0; i < rows.length; i++) {
+                    g.gridy = i;
+                    g.gridx = 0;
+                    g.weightx = 0;
+                    g.fill = java.awt.GridBagConstraints.NONE;
+                    JLabel l = new JLabel((String) rows[i][0]);
+                    l.setForeground(INK);
+                    th.add(l, g);
+                    g.gridx = 1;
+                    JSpinner sp = (JSpinner) rows[i][1];
+                    sp.setPreferredSize(new Dimension(72, sp.getPreferredSize().height));
+                    th.add(sp, g);
+                    g.gridx = 2;
+                    g.weightx = 1;
+                    g.fill = java.awt.GridBagConstraints.HORIZONTAL;
+                    th.add(wrapped((String) rows[i][2], MUTED), g);
+                }
+                JPanel thBody = new JPanel(new BorderLayout(0, 8));
+                thBody.add(th, BorderLayout.NORTH);
+                thBody.add(wrapped("Changes apply from the next run. Past predictions are never re-scored, so changing "
+                        + "these partway through means the track record mixes two set-ups.", MUTED), BorderLayout.SOUTH);
+
+                JPanel cols = new JPanel(new GridLayout(1, 2, 12, 0));
+                cols.add(section("News feeds", feedBody));
+                cols.add(section("Thresholds", thBody));
+                JPanel holder = new JPanel(new BorderLayout());
+                holder.add(cols, BorderLayout.NORTH);
+                add(holder, BorderLayout.CENTER);
+
+                // change tracking
+                feeds.addListDataListener(new javax.swing.event.ListDataListener() {
+                    @Override public void intervalAdded(javax.swing.event.ListDataEvent e) { changed(); }
+                    @Override public void intervalRemoved(javax.swing.event.ListDataEvent e) { changed(); }
+                    @Override public void contentsChanged(javax.swing.event.ListDataEvent e) { changed(); }
+                });
+                for (JSpinner sp : List.of(minArticles, predicted, rankPenalty, historyDays, calibration, grace)) {
+                    sp.addChangeListener(e -> changed());
+                    if (sp == rankPenalty) sp.setEditor(new JSpinner.NumberEditor(sp, "0.00"));
+                }
+                save.addActionListener(e -> save());
+                revert.addActionListener(e -> {
+                    dirty = false;
+                    fill(loadSettings(dir));
+                });
+                defaults.addActionListener(e -> fill(Settings.defaults(), true));
+                updateState(null);
+            }
+
+            void changed() {
+                if (loading) return;
+                dirty = true;
+                updateState(null);
+            }
+
+            void updateState(String message) {
+                save.setEnabled(dirty && !running);
+                revert.setEnabled(dirty);
+                testArchive.setEnabled(!running && dir != null && !archiveFiles(dir).isEmpty());
+                state.setText(message != null ? message : dirty ? "Unsaved changes" : " ");
+                state.setForeground(dirty && message == null ? new Color(0x8a5a00) : MUTED);
+            }
+
+            void setRunning(boolean on) {
+                running = on;
+                updateState(null);
+            }
+
+            /** The thresholds that differ between two settings, in words ("Stories that get predictions: 3 → 2"). */
+            static List<String> differences(Settings a, Settings b) {
+                List<String> out = new ArrayList<>();
+                if (a.minArticles() != b.minArticles())
+                    out.add("Headlines needed for a run: " + a.minArticles() + " → " + b.minArticles());
+                if (a.predictedStories() != b.predictedStories())
+                    out.add("Stories that get predictions: " + a.predictedStories() + " → " + b.predictedStories());
+                if (Math.abs(a.rankPenalty() - b.rankPenalty()) > 1e-9)
+                    out.add("Rank penalty: " + plain(a.rankPenalty()) + " → " + plain(b.rankPenalty()));
+                if (a.historyDays() != b.historyDays())
+                    out.add("Trend look-back: " + a.historyDays() + " → " + b.historyDays() + " days");
+                if (a.minForCalibration() != b.minForCalibration())
+                    out.add("Results before recalibrating: " + a.minForCalibration() + " → " + b.minForCalibration());
+                if (a.graceDays() != b.graceDays())
+                    out.add("Grace period: " + a.graceDays() + " → " + b.graceDays() + " days");
+                return out;
+            }
+
+            /**
+             * Replay the folder's archive twice, in temporary folders, once with the saved settings and once with the
+             * edits in the form, and show how each would have done. Nothing in the data folder changes.
+             */
+            void testOnArchive() {
+                Settings saved = loadSettings(dir);
+                Settings edited = current();
+                List<String> diff = differences(saved, edited);
+                if (diff.isEmpty()) {
+                    JOptionPane.showMessageDialog(gui.frame, "Change one or more thresholds first. This test replays the "
+                            + "archive with the saved settings and with your edits, and compares the two.\n(Feeds "
+                            + "don't matter here: a replay uses the archived headlines.)", "Test on archive",
+                            JOptionPane.INFORMATION_MESSAGE);
+                    return;
+                }
+                int days = archiveFiles(dir).size();
+                Path source = dir;
+
+                JDialog wait = new JDialog(gui.frame, "Test on archive", true);
+                JProgressBar bar = new JProgressBar(0, 2 * days);
+                bar.setStringPainted(true);
+                JButton cancel = new JButton("Cancel");
+                boolean[] stop = new boolean[1];
+                cancel.addActionListener(e -> { stop[0] = true; cancel.setEnabled(false); });
+                JPanel wp = new JPanel(new BorderLayout(0, 10));
+                wp.setBorder(BorderFactory.createEmptyBorder(16, 16, 16, 16));
+                wp.add(new JLabel("Replaying " + days + " archived days twice…"), BorderLayout.NORTH);
+                bar.setPreferredSize(new Dimension(380, bar.getPreferredSize().height));
+                wp.add(bar, BorderLayout.CENTER);
+                JPanel cp = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+                cp.add(cancel);
+                wp.add(cp, BorderLayout.SOUTH);
+                wait.setContentPane(wp);
+                wait.pack();
+                wait.setLocationRelativeTo(gui.frame);
+                wait.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+
+                gui.runPanel.lockControls(true);
+                setRunning(true);
+                new SwingWorker<Accuracy[], String>() {
+                    int done;
+
+                    @Override protected Accuracy[] doInBackground() throws Exception {
+                        Path a = Files.createTempDirectory("cassandra-saved-");
+                        Path b = Files.createTempDirectory("cassandra-edited-");
+                        java.io.PrintStream original = System.out;
+                        System.setOut(new java.io.PrintStream(java.io.OutputStream.nullOutputStream()));
+                        try {
+                            publish("Saved settings");
+                            replay(source, a, saved, line -> publish(""), () -> stop[0]);
+                            publish("Your edits");
+                            replay(source, b, edited, line -> publish(""), () -> stop[0]);
+                            if (stop[0]) return null;
+                            return new Accuracy[]{loadAccuracy(a), loadAccuracy(b)};
+                        } finally {
+                            System.setOut(original);
+                            saved.apply();   // a replay applies its settings; put the saved ones back
+                            deleteTree(a);
+                            deleteTree(b);
+                        }
+                    }
+
+                    @Override protected void process(List<String> chunks) {
+                        for (String c : chunks) {
+                            if (c.isEmpty()) bar.setValue(++done);
+                            else bar.setString(c + "…");
+                        }
+                    }
+
+                    @Override protected void done() {
+                        wait.dispose();
+                        gui.runPanel.lockControls(false);
+                        setRunning(false);
+                        Accuracy[] r;
+                        try { r = get(); } catch (Exception e) {
+                            JOptionPane.showMessageDialog(gui.frame, "The test failed: " + e.getMessage(),
+                                    "Test on archive", JOptionPane.ERROR_MESSAGE);
+                            return;
+                        }
+                        if (r == null) return;   // cancelled
+                        showComparison(days, diff, r[0], r[1]);
+                    }
+                }.execute();
+                wait.setVisible(true);   // modal until the worker disposes it
+            }
+
+            static void deleteTree(Path p) {
+                try (var s = Files.walk(p)) {
+                    s.sorted(Comparator.reverseOrder()).forEach(f -> f.toFile().delete());
+                } catch (IOException ignored) { /* temporary files; the system cleans them up eventually */ }
+            }
+
+            void showComparison(int days, List<String> diff, Accuracy a, Accuracy b) {
+                String[] rows = {"Predictions graded", "Came true", "Average forecast", "Brier score (lower is better)",
+                        "Skill vs base rate", "90% interval for skill"};
+                java.util.function.Function<Accuracy, String[]> col = x -> x == null || x.graded().isEmpty()
+                        ? new String[]{"0", "–", "–", "–", "–", "–"}
+                        : new String[]{String.valueOf(x.graded().size()),
+                        pct(x.graded().stream().mapToDouble(Cassandra::outcome).average().orElse(0)),
+                        pct(x.graded().stream().mapToDouble(Pred::p).average().orElse(0)),
+                        String.format(Locale.ROOT, "%.3f", x.bCass()), num(x.skill(), "%+.2f"),
+                        x.ci() == null ? "too few to judge"
+                                : String.format(Locale.ROOT, "%+.2f to %+.2f", x.ci()[0], x.ci()[1])};
+                String[] ca = col.apply(a), cb = col.apply(b);
+                StringBuilder h = new StringBuilder("<html><body style='font-family: sans-serif; width: 470px'>");
+                h.append("<p>Both replays used the same <b>").append(days).append(" archived days</b>. Your edits:</p><ul>");
+                for (String d : diff) h.append("<li>").append(escape(d)).append("</li>");
+                h.append("</ul><table cellpadding='5' cellspacing='0'>")
+                        .append("<tr><th></th><th align='right'>Saved settings</th><th align='right'>&nbsp;&nbsp;Your edits</th></tr>");
+                for (int i = 0; i < rows.length; i++)
+                    h.append("<tr><td>").append(rows[i]).append("</td><td align='right'>").append(ca[i])
+                            .append("</td><td align='right'>&nbsp;&nbsp;<b>").append(cb[i]).append("</b></td></tr>");
+                h.append("</table><p style='margin-top: 10px'>").append(escape(verdict(a, b))).append("</p>")
+                        .append("<p style='margin-top: 8px; color: #6b7280'>The data folder was not changed. Save your edits to use them "
+                                + "from the next run, or Revert to discard them.</p></body></html>");
+                JOptionPane.showMessageDialog(gui.frame, new JLabel(h.toString()), "Test on archive: results",
+                        JOptionPane.PLAIN_MESSAGE);
+            }
+
+            /** A plain reading of the comparison, which does not claim more than the intervals support. */
+            static String verdict(Accuracy a, Accuracy b) {
+                if (a == null || b == null || a.ci() == null || b.ci() == null)
+                    return "Too few graded predictions to compare skill fairly yet. A longer archive will give a "
+                            + "clearer answer.";
+                double d = b.skill() - a.skill();
+                boolean overlap = b.ci()[0] <= a.ci()[1] && a.ci()[0] <= b.ci()[1];
+                String dir = Math.abs(d) < 0.01 ? "about the same skill as" : d > 0 ? "more skill than" : "less skill than";
+                return "Your edits show " + dir + " the saved settings (" + String.format(Locale.ROOT, "%+.2f", d)
+                        + " in skill). " + (overlap
+                        ? "The two intervals overlap, so the difference could be luck; don't read much into it yet."
+                        : "The intervals don't overlap, so the difference is probably real, at least on these days.")
+                        + (a.graded().size() != b.graded().size()
+                        ? " Note that the two made different numbers of predictions, so they were not tested on "
+                        + "exactly the same questions." : "");
+            }
+
+            /** Fresh settings from a reload. Unsaved edits to the same folder are kept. */
+            void setData(Path folder, Settings s) {
+                boolean sameFolder = folder.equals(dir);
+                dir = folder;
+                Path f = folder.resolve(CONFIG).toAbsolutePath().normalize();
+                where.setText((Files.exists(f) ? "Saved in " + f : "Using the defaults. Saving creates " + f)
+                        + ". Cassandra reads this file on every run in this folder, scheduled ones included.");
+                if (dirty && sameFolder) return;
+                dirty = false;
+                fill(s);
+            }
+
+            void fill(Settings s) { fill(s, false); }
+
+            void fill(Settings s, boolean markDirty) {
+                loading = true;
+                feeds.clear();
+                s.feeds().forEach(feeds::addElement);
+                minArticles.setValue(s.minArticles());
+                predicted.setValue(s.predictedStories());
+                rankPenalty.setValue(s.rankPenalty());
+                historyDays.setValue(s.historyDays());
+                calibration.setValue(s.minForCalibration());
+                grace.setValue(s.graceDays());
+                loading = false;
+                if (markDirty) dirty = true;
+                updateState(null);
+            }
+
+            Settings current() {
+                return new Settings(Collections.list(feeds.elements()), (Integer) minArticles.getValue(),
+                        (Integer) predicted.getValue(), Math.round((Double) rankPenalty.getValue() * 100) / 100.0,
+                        (Integer) historyDays.getValue(), (Integer) calibration.getValue(), (Integer) grace.getValue());
+            }
+
+            void addFeed() {
+                String u = newFeed.getText().trim();
+                if (u.isEmpty()) return;
+                if (!(u.startsWith("https://") || u.startsWith("http://"))) {
+                    JOptionPane.showMessageDialog(gui.frame, "A feed address must start with https:// or http://",
+                            "Add feed", JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+                if (!feeds.contains(u)) feeds.addElement(u);
+                newFeed.setText("");
+            }
+
+            void testFeeds() {
+                List<String> sel = feedList.getSelectedValuesList();
+                if (sel.isEmpty()) sel = Collections.list(feeds.elements());
+                List<String> urls = sel;
+                state.setText("Testing " + urls.size() + (urls.size() == 1 ? " feed…" : " feeds…"));
+                new SwingWorker<String, Void>() {
+                    @Override protected String doInBackground() {
+                        StringBuilder out = new StringBuilder();
+                        for (String u : urls) {
+                            try {
+                                out.append("✓ ").append(fetchFeed(u).size()).append(" headlines: ").append(u);
+                            } catch (Exception e) {
+                                out.append("✗ Could not read ").append(u).append(" (").append(e.getMessage()).append(")");
+                            }
+                            out.append('\n');
+                        }
+                        return out.toString();
+                    }
+                    @Override protected void done() {
+                        updateState(null);
+                        String text;
+                        try { text = get(); } catch (Exception e) { text = e.toString(); }
+                        JTextArea t = new JTextArea(text.trim());
+                        t.setEditable(false);
+                        JOptionPane.showMessageDialog(gui.frame, new JScrollPane(t), "Feed test",
+                                JOptionPane.INFORMATION_MESSAGE);
+                    }
+                }.execute();
+            }
+
+            void save() {
+                Settings s = current();
+                if (s.feeds().isEmpty()) {
+                    JOptionPane.showMessageDialog(gui.frame, "Add at least one feed before saving.", "Settings",
+                            JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+                try {
+                    saveSettings(dir, s);
+                    dirty = false;
+                    updateState("Saved at " + java.time.LocalTime.now().withNano(0) + ". Used from the next run.");
+                    setData(dir, s);
+                    updateState("Saved at " + java.time.LocalTime.now().withNano(0) + ". Used from the next run.");
+                } catch (IOException e) {
+                    JOptionPane.showMessageDialog(gui.frame, "Couldn't save the settings: " + e.getMessage(),
+                            "Settings", JOptionPane.ERROR_MESSAGE);
+                }
+            }
         }
     }
 }
