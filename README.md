@@ -12,7 +12,7 @@ Nobody can see the future, and Cassandra doesn't claim to. What she can do is ma
 
 ![Cassandra's desktop window, showing the Today tab: three story cards with predictions, a coverage chart and headlines](today-tab.png)
 
-*The Today tab of the desktop window (`--gui`), after 35 days of synthetic demo data shows how well her predictions have held up.*
+*The Today tab of the desktop window (`--gui`) from earlier release, after 35 days of synthetic demo data shows how well her predictions have held up.*
 
 ## How accurate is she?
 
