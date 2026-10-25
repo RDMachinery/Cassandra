@@ -314,7 +314,7 @@ public class Cassandra {
                 .connectTimeout(Duration.ofSeconds(10)).build();
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                 .timeout(Duration.ofSeconds(15))
-                .header("User-Agent", "Cassandra/1.0 (educational project)")
+                .header("User-Agent", "Cassandra/2.0 (https://github.com/RDMachinery/Cassandra)")
                 .GET().build();
         HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
         if (resp.statusCode() != 200) throw new RuntimeException("HTTP " + resp.statusCode());
