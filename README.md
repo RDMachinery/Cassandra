@@ -187,7 +187,7 @@ java Cassandra --publish=site
 
 This runs her as usual, then writes a website into a folder called `site`. The site shows her scorecard, today's forecasts and her charts, and offers an RSS feed and a downloadable file of every prediction she has ever made. That file comes with a "fingerprint" (a SHA-256 checksum) so anyone can confirm it hasn't been altered.
 
-![The published website: scorecard and today's forecasts](docs/published-site.png)
+![The published website: scorecard and today's forecasts](published-site.png)
 
 Cassandra only creates the files; she never posts or uploads anything herself. To put the site online for free, you can use **GitHub Pages**, and a scheduled job can publish it every day. Step-by-step instructions are in the [technical guide](TECHNICAL.md#publishing-on-github-pages).
 
