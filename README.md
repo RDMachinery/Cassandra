@@ -8,7 +8,7 @@ Every day, Cassandra reads the headlines from the BBC and the Guardian, works ou
 
 A few days later she checks whether she was right, all by herself, and keeps a running score. That score is the point. Nobody can see the future, and Cassandra doesn't pretend to. What she can do is make claims you can test, and tell you plainly how often she gets them right.
 
-![Cassandra's desktop window, showing today's three leading stories with their predictions, a chart of how much coverage the selected story is getting, and its latest headlines](today-tab.png)
+![Cassandra's desktop window, showing today's three leading stories with their predictions, a chart of how much coverage the selected story is getting, and its latest headlines](screenshot2.jpeg)
 
 *Cassandra's desktop window. This example uses made-up demo headlines.*
 
