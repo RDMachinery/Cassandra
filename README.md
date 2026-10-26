@@ -8,7 +8,7 @@ Every day, Cassandra reads the headlines from the BBC and the Guardian, works ou
 
 A few days later she checks whether she was right, all by herself, and keeps a running score. That score is the point. Nobody can see the future, and Cassandra doesn't pretend to. What she can do is make claims you can test, and tell you plainly how often she gets them right.
 
-![Cassandra's desktop window, showing today's three leading stories with their predictions, a chart of how much coverage the selected story is getting, and its latest headlines](docs/today-tab.png)
+![Cassandra's desktop window, showing today's three leading stories with their predictions, a chart of how much coverage the selected story is getting, and its latest headlines](today-tab.png)
 
 *Cassandra's desktop window. This example uses made-up demo headlines.*
 
@@ -115,23 +115,23 @@ The window shows everything Cassandra knows, in six tabs. It updates by itself a
 
 **Accuracy** answers "is she any good?" at a glance. A coloured banner gives the verdict: green if she's beating "what usually happens", red if she's worse, amber if it's too close to call, grey if it's too early to say. The chart on the left shows whether things she calls 70% likely really happen about 70% of the time.
 
-![The Accuracy tab: the verdict, headline scores, a chart of how well her probabilities match reality, and her score week by week](docs/accuracy-tab.png)
+![The Accuracy tab: the verdict, headline scores, a chart of how well her probabilities match reality, and her score week by week](accuracy-tab.png)
 
 **Predictions** lists every prediction she has ever made, with its outcome. You can sort it, filter it (for example to show only the predictions that didn't happen), search for a story, and save the list as a spreadsheet file. A line above the table shows how well she did on whatever is currently shown.
 
-![The Predictions tab, a table of predictions with their probabilities and outcomes](docs/predictions-tab.png)
+![The Predictions tab, a table of predictions with their probabilities and outcomes](predictions-tab.png)
 
 **Story history** follows one story over time: how much coverage it got each day, how high it ranked, and every prediction made about it, marked with a green dot if it came true or a red cross if it didn't.
 
-![The Story history tab for the storm story: its coverage, its rank, and its predictions marked as hits or misses](docs/story-history-tab.png)
+![The Story history tab for the storm story: its coverage, its rank, and its predictions marked as hits or misses](story-history-tab.png)
 
 **Run** lets you run Cassandra from the window. In **live** mode, **Run now** reads today's news. In **demo** mode, which uses a separate folder so it can never mix with your real record, you can run demo days one at a time or many at once. The **Run health** panel tells you when she last ran and whether any days were missed.
 
-![The Run tab after simulating 35 demo days](docs/run-tab.png)
+![The Run tab after simulating 35 demo days](run-tab.png)
 
 **Settings** is where you choose her news feeds (with a button to test that each one works) and adjust her thresholds, such as how many stories get predictions. Each setting has a short explanation. Settings are saved with your data and used by every run, including scheduled ones.
 
-![The Settings tab: news feeds on the left, thresholds on the right](docs/settings-tab.png)
+![The Settings tab: news feeds on the left, thresholds on the right](settings-tab.png)
 
 The window only changes your data when you press a run button or **Save**. On a Mac it will look slightly different from these screenshots, which were taken on Linux.
 
@@ -171,11 +171,11 @@ Every run keeps a copy of the exact headlines it read. Cassandra can **replay** 
 
 **In the window:** on the **Settings** tab, change a setting but don't save it yet, and press **Test on archive…**. She replays every archived day twice, once with your saved settings and once with your change, and compares the two:
 
-![Test on archive: the saved settings and the change side by side, with a verdict](docs/test-on-archive.png)
+![Test on archive: the saved settings and the change side by side, with a verdict](test-on-archive.png)
 
 She tells you honestly whether the difference is big enough to trust or could be down to luck. Nothing in your data changes until you press **Save**.
 
-**In Terminal:** `java Cassandra --replay=cassandra-data` replays your archive into a separate folder and reports the result. See the [technical guide](docs/TECHNICAL.md#replay) for testing different settings this way.
+**In Terminal:** `java Cassandra --replay=cassandra-data` replays your archive into a separate folder and reports the result. See the [technical guide](TECHNICAL.md#replay) for testing different settings this way.
 
 ## Publishing her forecasts
 
@@ -189,7 +189,7 @@ This runs her as usual, then writes a website into a folder called `site`. The s
 
 ![The published website: scorecard and today's forecasts](docs/published-site.png)
 
-Cassandra only creates the files; she never posts or uploads anything herself. To put the site online for free, you can use **GitHub Pages**, and a scheduled job can publish it every day. Step-by-step instructions are in the [technical guide](docs/TECHNICAL.md#publishing-on-github-pages).
+Cassandra only creates the files; she never posts or uploads anything herself. To put the site online for free, you can use **GitHub Pages**, and a scheduled job can publish it every day. Step-by-step instructions are in the [technical guide](TECHNICAL.md#publishing-on-github-pages).
 
 **A caution.** Her predictions are about news coverage. If she ever became widely read, her forecasts could start to influence the coverage they predict, and her score would partly measure her influence rather than her foresight. So the website reports her accuracy since publication separately. For the same reason, she never posts, shares or promotes stories.
 
@@ -235,7 +235,7 @@ When she fetches a news feed, Cassandra sends only a standard request for that f
 
 ## For developers
 
-Cassandra is a single Java file with no external libraries. The [technical guide](docs/TECHNICAL.md) covers how she works in detail: the scoring maths, every step of a run, the saved file formats, all settings and where to change things in the code, the self-test, replay, publishing on GitHub Pages, and the full version history.
+Cassandra is a single Java file with no external libraries. The [technical guide](TECHNICAL.md) covers how she works in detail: the scoring maths, every step of a run, the saved file formats, all settings and where to change things in the code, the self-test, replay, publishing on GitHub Pages, and the full version history.
 
 Issues and pull requests are welcome. Please run `java Cassandra --selftest` before submitting changes.
 
