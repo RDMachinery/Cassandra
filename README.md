@@ -10,7 +10,7 @@ A few days later she checks whether she was right, all by herself, and keeps a r
 
 ![Cassandra's desktop window, showing today's three leading stories with their predictions, a chart of how much coverage the selected story is getting, and its latest headlines](screenshot2.jpeg)
 
-*Cassandra's desktop window. This example uses made-up demo headlines.*
+*Cassandra's desktop window. This example uses real headlines.*
 
 ## Contents
 
