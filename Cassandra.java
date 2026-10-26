@@ -106,11 +106,21 @@ public class Cassandra {
         double share() { return total == 0 ? 0 : (double) count / total; }
     }
 
-    /** One prediction. outcome: PENDING, TRUE, FALSE, VOID (could not be graded). */
+    /**
+     * One prediction. outcome: PENDING, TRUE, FALSE, VOID (could not be graded). pRaw is her first guess (the
+     * hand-set prior); p is the probability issued. features records the evidence it was made on, as
+     * name=value pairs separated by ';' (r rank, m momentum, t trend, s tone strength, b the type's base rate);
+     * it is empty for predictions made before Cassandra recorded evidence.
+     */
     record Pred(String id, LocalDate made, LocalDate due, String term, String label, String kind,
-                String param, double pRaw, double p, String outcome, String resolved) {
+                String param, double pRaw, double p, String outcome, String resolved, String features) {
         Pred with(String newOutcome, String when) {
-            return new Pred(id, made, due, term, label, kind, param, pRaw, p, newOutcome, when);
+            return new Pred(id, made, due, term, label, kind, param, pRaw, p, newOutcome, when, features);
+        }
+        /** The value of one evidence feature, or null if it wasn't recorded. */
+        String feature(String name) {
+            for (String kv : features.split(";")) if (kv.startsWith(name + "=")) return kv.substring(name.length() + 1);
+            return null;
         }
         boolean graded() { return outcome.equals("TRUE") || outcome.equals("FALSE"); }
         int days() { return (int) ChronoUnit.DAYS.between(made, due); }
@@ -133,7 +143,8 @@ public class Cassandra {
      * or null if it is new today. points: number of daily observations the trend fit can use.
      */
     record Story(int rank, String term, List<Doc> docs, String label, double net, Tone tone,
-                 String momentum, double share, LocalDate firstSeen, int points, Forecast fc) {}
+                 String momentum, double share, LocalDate firstSeen, int points, Forecast fc,
+                 double shareBefore) {}   // shareBefore: average share over the momentum window, NaN if no runs
 
     /** Today's picture of the news, used both to make and to grade predictions. */
     static class Snapshot {
@@ -227,12 +238,15 @@ public class Cassandra {
 
     public static void main(String[] args) throws IOException {
         boolean demo = false, log = true;
-        String dataArg = null, replayArg = null;
-        boolean asof = false, accuracy = false, gui = false;
+        String dataArg = null, replayArg = null, publishArg = null, siteUrl = REPO_URL;
+        boolean asof = false, accuracy = false, gui = false, publishOnly = false;
         List<String> feeds = new ArrayList<>();
 
         for (String a : args) {
             if (a.equals("--demo")) demo = true;
+            else if (a.startsWith("--publish=")) publishArg = a.substring(10);
+            else if (a.startsWith("--publish-only=")) { publishArg = a.substring(15); publishOnly = true; }
+            else if (a.startsWith("--site-url=")) siteUrl = a.substring(11);
             else if (a.startsWith("--replay=")) replayArg = a.substring(9);
             else if (a.equals("--report")) accuracy = true;
             else if (a.equals("--gui")) gui = true;
@@ -257,6 +271,7 @@ public class Cassandra {
         Settings settings = loadSettings(dir);   // the folder's cassandra.properties, or the defaults
         settings.apply();
         if (accuracy) { accuracyReport(dir); return; }
+        if (publishOnly) { publish(dir, Paths.get(publishArg), demo, siteUrl); return; }
         List<Article> articles;
 
         if (demo) {
@@ -270,9 +285,13 @@ public class Cassandra {
         if (articles.size() < MIN_ARTICLES) {
             System.out.println("Only " + articles.size() + " articles available - not enough signal to say "
                     + "anything meaningful. Check your network connection or feed URLs.");
-            return;
+        } else {
+            report(articles, dir, log);
         }
-        report(articles, dir, log);
+        if (publishArg != null) {   // publish what is saved, even if today's run could not go ahead
+            System.out.println();
+            publish(dir, Paths.get(publishArg), demo, siteUrl);
+        }
     }
 
     static void usage() {
@@ -287,6 +306,10 @@ public class Cassandra {
                   --gui           open the desktop window (use with --data=DIR or --demo to pick the data)
                   --replay=DIR    re-run Cassandra over DIR's archived headlines into a fresh folder
                                   (--data=OUT, default DIR-replay), then report its accuracy
+                  --publish=SITE  after the run, write a static website (index.html, feed.xml,
+                                  predictions.csv, predictions.sha256) into SITE
+                  --publish-only=SITE   write the website from saved results, without running
+                  --site-url=URL  the published site's address, used as the RSS feed's link
                 """);
     }
 
@@ -314,7 +337,7 @@ public class Cassandra {
                 .connectTimeout(Duration.ofSeconds(10)).build();
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                 .timeout(Duration.ofSeconds(15))
-                .header("User-Agent", "Cassandra/2.0 (https://github.com/RDMachinery/Cassandra)")
+                .header("User-Agent", "Cassandra News Forecaster - https://github.com/RDMachinery/Cassandra")
                 .GET().build();
         HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
         if (resp.statusCode() != 200) throw new RuntimeException("HTTP " + resp.statusCode());
@@ -422,18 +445,44 @@ public class Cassandra {
         return best;
     }
 
-    static String momentum(List<Doc> story) {
-        long recent = story.stream().filter(d -> age(d) <= 8).count();
-        long earlier = story.stream().filter(d -> age(d) > 8 && age(d) <= 32).count();
-        if (recent + earlier < 4) return "unclear";
-        double recentRate = recent / 8.0, earlierRate = earlier / 24.0;
-        if (earlierRate == 0) return "accelerating";
-        double ratio = recentRate / earlierRate;
-        return ratio > 1.3 ? "accelerating" : ratio < 0.7 ? "fading" : "steady";
+    static final int MOMENTUM_DAYS = 3;   // momentum compares today with the runs of this many previous days
+
+    /** How a story's coverage is moving. label: accelerating, steady, fading, new or unclear. */
+    record Momentum(String label, double before) {}
+
+    /**
+     * Momentum from the daily record: today's share of headlines against the story's average share on the runs
+     * of the previous MOMENTUM_DAYS days (a run where it was outside the top 10 counts as 0). It must change
+     * by at least 3 points and 30% to count as accelerating or fading.
+     *
+     * (Momentum used to compare article timestamps within a single fetch. Feeds mostly carry recent items, so
+     * that almost always read as "accelerating".)
+     */
+    static Momentum momentumOf(List<HistRow> history, String term, double shareNow) {
+        LocalDate from = TODAY.minusDays(MOMENTUM_DAYS);
+        List<LocalDate> runs = history.stream().map(HistRow::date)
+                .filter(d -> d.isBefore(TODAY) && !d.isBefore(from)).distinct().toList();
+        if (runs.isEmpty()) return new Momentum("unclear", Double.NaN);
+        double before = 0;
+        for (LocalDate d : runs)
+            before += history.stream().filter(r -> r.date().equals(d) && r.term().equals(term)).findFirst()
+                    .map(HistRow::share).orElse(0.0);
+        before /= runs.size();
+        if (before == 0) return new Momentum("new", 0);
+        double change = shareNow - before;
+        if (change >= 0.03 && shareNow > before * 1.3) return new Momentum("accelerating", before);
+        if (change <= -0.03 && shareNow < before * 0.7) return new Momentum("fading", before);
+        return new Momentum("steady", before);
     }
 
-    static double age(Doc d) {
-        return Duration.between(d.article().published(), NOW).toMinutes() / 60.0;
+    /** Momentum with the numbers behind it, for the report. */
+    static String momentumDetail(Story s) {
+        return switch (s.momentum()) {
+            case "unclear" -> "unclear (no runs in the previous " + MOMENTUM_DAYS + " days to compare with)";
+            case "new" -> "new (not in the top 10 on the previous " + MOMENTUM_DAYS + " days' runs)";
+            default -> String.format(Locale.ROOT, "%s (%.0f%% of headlines today against %.0f%% on average over "
+                    + "the previous %d days)", s.momentum(), s.share() * 100, s.shareBefore() * 100, MOMENTUM_DAYS);
+        };
     }
 
     static String bestPhrase(String term, List<Doc> docs) {
@@ -580,7 +629,7 @@ public class Cassandra {
 
         // 5. Issue new predictions for each leading story
         List<Pred> fresh = new ArrayList<>();
-        for (Story s : top) fresh.addAll(makePredictions(s, history, record));
+        for (Story s : top) fresh.addAll(makePredictions(s, history, record, preds));
         Set<String> known = preds.stream().map(Pred::id).collect(Collectors.toSet());
         List<Pred> toAdd = fresh.stream().filter(p -> !known.contains(p.id())).toList();
         if (log) {
@@ -638,9 +687,9 @@ public class Cassandra {
         System.out.println("\nDOMINANT STORY: \"" + lead.label() + "\"");
         System.out.println(wrap(String.format(Locale.ROOT,
                 "Mentioned in %d of %d articles (%.0f%% of coverage) across %d outlet(s). Domain: %s. "
-                        + "Tone: %s (net sentiment %+.2f per article). Momentum today: %s.%s",
+                        + "Tone: %s (net sentiment %+.2f per article). Momentum: %s.%s",
                 lead.docs().size(), r.headlines(), lead.share() * 100, r.sources(), r.domain().name().toLowerCase(),
-                lead.tone().name().toLowerCase(), lead.net(), lead.momentum(),
+                lead.tone().name().toLowerCase(), lead.net(), momentumDetail(lead),
                 r.related().isEmpty() ? "" : " Frequently linked with: " + String.join(", ", r.related()) + "."), ""));
 
         System.out.println("\nSAMPLE HEADLINES");
@@ -682,7 +731,7 @@ public class Cassandra {
             for (Pred p : r.fresh())
                 if (p.term().equals(s.term()))
                     System.out.println(wrap("- " + statement(p) + "  -> " + pct(p.p())
-                            + (p.p() != p.pRaw() ? " [recalibrated from " + pct(p.pRaw()) + "]" : ""), "     ", "       "));
+                            + startingPoint(p), "     ", "       "));
         }
         if (!r.logged()) System.out.println("  (--no-log: these were not saved and cannot be graded later)");
         else if (r.added() == 0) System.out.println("  (already logged earlier today)");
@@ -724,11 +773,43 @@ public class Cassandra {
         Tone tone = net <= -0.5 ? Tone.NEGATIVE : net >= 0.5 ? Tone.POSITIVE : Tone.MIXED;
         double share = snap.share(term);
         List<double[]> pts = trendPoints(history, term, share);
-        return new Story(rank, term, ds, bestPhrase(term, ds), net, tone, momentum(ds), share,
-                firstSeen(history, term), pts.size(), fit(pts));
+        Momentum m = momentumOf(history, term, share);
+        return new Story(rank, term, ds, bestPhrase(term, ds), net, tone, m.label(), share,
+                firstSeen(history, term), pts.size(), fit(pts), m.before());
     }
 
-    static List<Pred> makePredictions(Story s, List<HistRow> history, Map<String, Stat> record) {
+    static final int BASE_PRIOR_WEIGHT = 10;   // pseudo-results pulling a group's rate towards its parent's
+
+    /**
+     * Start from the base rate of this prediction type (how often its claims have come true so far), then
+     * refine it through each piece of evidence in turn: the rate among past predictions that shared that
+     * evidence, shrunk towards the previous step as (hits + k * parent) / (n + k), k = BASE_PRIOR_WEIGHT.
+     * A group with few results therefore stays close to the base rate, and evidence only moves the
+     * probability as far as the record shows it matters. Only results already known today are used.
+     * Returns {probability, base rate}, or null while the type has fewer than BASE_WARMUP graded results.
+     */
+    static double[] fromBaseRate(List<Pred> known, String key, String... evidence) {
+        List<Pred> group = known.stream()
+                .filter(p -> p.graded() && p.key().equals(key) && !resolvedOn(p).isAfter(TODAY)).toList();
+        if (group.size() < BASE_WARMUP) return null;
+        double base = (group.stream().filter(p -> p.outcome().equals("TRUE")).count() + 0.5) / (group.size() + 1.0);
+        double p = base;
+        for (String e : evidence) {
+            String[] kv = e.split("=", 2);
+            group = group.stream().filter(x -> kv[1].equals(x.feature(kv[0]))).toList();
+            long hits = group.stream().filter(x -> x.outcome().equals("TRUE")).count();
+            p = (hits + BASE_PRIOR_WEIGHT * p) / (group.size() + BASE_PRIOR_WEIGHT);
+        }
+        return new double[]{clamp(p, 0.03, 0.97), base};
+    }
+
+    static String trendBucket(Forecast fc) {
+        if (fc == null) return "none";
+        double z = fc.slope() * 3 / fc.predSd(3);
+        return z > 0.5 ? "up" : z < -0.5 ? "down" : "flat";
+    }
+
+    static List<Pred> makePredictions(Story s, List<HistRow> history, Map<String, Stat> record, List<Pred> known) {
         List<Pred> out = new ArrayList<>();
         String term = s.term(), label = s.label(), momentum = s.momentum();
         Tone tone = s.tone();
@@ -748,31 +829,49 @@ public class Cassandra {
         double top3 = clamp(0.62 - RANK_PENALTY * (s.rank() - 1) + 0.05 * Math.min(streak, 5) + mom, 0.10, 0.92);
         double top7 = clamp(top3 - 0.15, 0.10, 0.92);
 
-        out.add(pred(term, label, "TOP5", 3, "-", top3, record));
-        out.add(pred(term, label, "TOP5", 7, "-", top7, record));
+        // the hand-set priors above are her first guesses; once a type has a record, pred() starts from its base rate
+        String r = "r=" + s.rank(), m = "m=" + momentum;
+        out.add(pred(term, label, "TOP5", 3, "-", top3, record, known, r, m));
+        out.add(pred(term, label, "TOP5", 7, "-", top7, record, known, r, m));
 
         // will its share of coverage be higher in 3 days than today?
         double up;
         if (fc != null) up = phi(fc.slope() * 3 / fc.predSd(3));
-        else up = momentum.equals("accelerating") ? 0.55 : momentum.equals("fading") ? 0.30 : 0.42;
+        else up = momentum.equals("accelerating") ? 0.55 : momentum.equals("fading") ? 0.30
+                : momentum.equals("new") ? 0.45 : 0.42;
         out.add(pred(term, label, "SHARE_UP", 3, String.format(Locale.ROOT, "%.4f", shareNow),
-                clamp(up, 0.05, 0.95), record));
+                clamp(up, 0.05, 0.95), record, known, "t=" + trendBucket(fc), m));
 
         // will the tone persist?
         if (tone != Tone.MIXED) {
             double a = Math.abs(net);
             double pt = a >= 1.5 ? 0.72 : a >= 1.0 ? 0.66 : 0.58;
-            out.add(pred(term, label, "TONE_PERSIST", 3, tone == Tone.NEGATIVE ? "NEG" : "POS", pt, record));
+            out.add(pred(term, label, "TONE_PERSIST", 3, tone == Tone.NEGATIVE ? "NEG" : "POS", pt, record, known,
+                    "s=" + (a >= 1.5 ? "strong" : a >= 1.0 ? "medium" : "mild")));
         }
         return out;
     }
 
-    static Pred pred(String term, String label, String kind, int days, String param, double pRaw,
-                     Map<String, Stat> record) {
+    /**
+     * One prediction. Once its type has a track record the probability starts from the type's base rate and is
+     * refined by the evidence (fromBaseRate); until then it is her hand-set first guess, recalibrated.
+     */
+    static Pred pred(String term, String label, String kind, int days, String param, double firstGuess,
+                     Map<String, Stat> record, List<Pred> known, String... evidence) {
         LocalDate due = TODAY.plusDays(days);
-        double p = calibrate(pRaw, record.get(kind + "@" + days));
+        String key = kind + "@" + days;
+        double[] b = fromBaseRate(known, key, evidence);
+        String features = String.join(";", evidence);
+        double p;
+        if (b != null) {
+            p = b[0];
+            features += String.format(Locale.ROOT, ";b=%.4f", b[1]);
+        } else {
+            p = calibrate(firstGuess, record.get(key));
+        }
         String id = TODAY + "-" + kind + days + "-" + term;
-        return new Pred(id, TODAY, due, term, label.replace('\t', ' '), kind, param, pRaw, p, "PENDING", "-");
+        return new Pred(id, TODAY, due, term, label.replace('\t', ' '), kind, param, firstGuess, p, "PENDING", "-",
+                features);
     }
 
     static String statement(Pred p) {
@@ -784,6 +883,56 @@ public class Cassandra {
                     + (p.param().equals("NEG") ? "negative" : "positive") + " in tone.";
             default -> p.kind() + " " + p.label();
         };
+    }
+
+    /** A prediction type ("TOP5@3") in words, without the code. */
+    static String typeLabel(String key) {
+        String[] k = key.split("@");
+        String what = switch (k[0]) {
+            case "TOP5" -> "Still in the top 5";
+            case "SHARE_UP" -> "Larger share of headlines";
+            case "TONE_PERSIST" -> "Tone stays the same";
+            default -> k[0];
+        };
+        return what + " after " + (k.length > 1 ? k[1] : "?") + " days";
+    }
+
+    static String outcomeText(Pred p) {
+        return switch (p.outcome()) {
+            case "TRUE" -> "Came true";
+            case "FALSE" -> "Didn't happen";
+            case "VOID" -> "Void";
+            default -> "Pending";
+        };
+    }
+
+    /** What a prediction claims, without its date. */
+    static String claim(Pred p) {
+        return switch (p.kind()) {
+            case "TOP5" -> "Still in the top 5";
+            case "SHARE_UP" -> "Bigger share than "
+                    + String.format(Locale.ROOT, "%.0f%%", Double.parseDouble(p.param()) * 100);
+            case "TONE_PERSIST" -> "Coverage still " + (p.param().equals("NEG") ? "negative" : "positive");
+            default -> p.kind();
+        };
+    }
+
+    /** Write predictions as CSV (RFC 4180 quoting). Returns how many were written. */
+    static int writePredictionsCsv(Path target, List<Pred> ps) throws IOException {
+        List<String> lines = new ArrayList<>();
+        lines.add("id,made,due,story,term,type,claim,statement,probability,probability_before_recalibration,"
+                + "outcome,graded_on");
+        for (Pred p : ps)
+            lines.add(String.join(",", csv(p.id()), p.made().toString(), p.due().toString(), csv(p.label()),
+                    csv(p.term()), csv(p.key()), csv(claim(p)), csv(statement(p)),
+                    String.format(Locale.ROOT, "%.4f", p.p()), String.format(Locale.ROOT, "%.4f", p.pRaw()),
+                    csv(outcomeText(p)), p.resolved().equals("-") ? "" : p.resolved()));
+        Files.write(target, lines, StandardCharsets.UTF_8);
+        return ps.size();
+    }
+
+    static String csv(String s) {
+        return s.contains(",") || s.contains("\"") || s.contains("\n") ? "\"" + s.replace("\"", "\"\"") + "\"" : s;
     }
 
     /** Grade a prediction if it is due. Returns the same object if it is not yet due. */
@@ -1436,6 +1585,378 @@ public class Cassandra {
         }
     }
 
+    // ------------------------------------------------------------------ publishing (--publish)
+
+    static final String REPO_URL = "http://github.com/RDMachinery/Cassandra";
+    static final String SINCE = "since.txt";
+
+    /**
+     * Write a static website for the data folder into site: index.html (today's forecasts, the scorecard and
+     * charts), feed.xml (RSS, one item per day of forecasts), predictions.csv (every prediction ever made) and
+     * predictions.sha256 (its fingerprint). since.txt records the first day of publication, so accuracy can be
+     * shown separately from then on. Nothing is sent anywhere: put the folder online yourself (e.g. GitHub Pages).
+     */
+    static void publish(Path data, Path site, boolean demo, String siteUrl) throws IOException {
+        Files.createDirectories(site);
+        List<Pred> preds = Files.exists(data.resolve("predictions.tsv")) ? loadPreds(data) : new ArrayList<>();
+        preds.sort(Comparator.comparing(Pred::made).thenComparing(Pred::id));
+        Latest latest = loadLatest(data);
+        Accuracy acc = computeAccuracy(preds, data);
+        // label demo data even if --demo wasn't given: its headlines come from the synthetic demo wires
+        demo |= latest != null && latest.stories().stream().flatMap(s -> s.headlines().stream())
+                .anyMatch(a -> a.source().startsWith("demo-wire"));
+
+        LocalDate since;
+        Path sf = site.resolve(SINCE);
+        try {
+            since = LocalDate.parse(Files.readString(sf).trim());
+        } catch (IOException | RuntimeException e) {
+            since = latest != null ? latest.date() : TODAY;
+            Files.writeString(sf, since + "\n");
+        }
+        LocalDate first = since;
+        Accuracy accSince = computeAccuracy(preds.stream().filter(p -> !p.made().isBefore(first)).toList(), data);
+
+        writePredictionsCsv(site.resolve("predictions.csv"), preds);
+        String hash = sha256(site.resolve("predictions.csv"));
+        writeAtomically(site.resolve("predictions.sha256"), List.of(hash + "  predictions.csv"));
+        writeAtomically(site.resolve("feed.xml"), List.of(feedXml(preds, latest, demo, siteUrl)));
+        writeAtomically(site.resolve("index.html"), List.of(siteHtml(preds, latest, acc, accSince, since, hash, demo)));
+        System.out.println(wrap(String.format(Locale.ROOT, "Published to %s: index.html, feed.xml and predictions.csv "
+                + "(%d predictions, SHA-256 %s...). Commit and push the folder to put it online.",
+                site.toAbsolutePath().normalize(), preds.size(), hash.substring(0, 12)), ""));
+    }
+
+    static String sha256(Path f) throws IOException {
+        try {
+            byte[] d = java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(f));
+            StringBuilder s = new StringBuilder();
+            for (byte b : d) s.append(String.format("%02x", b));
+            return s.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException(e);
+        }
+    }
+
+    static String esc(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    /** Wilson score interval for a proportion (z = 1.645 gives 90%). */
+    static double[] wilsonInterval(double obs, int n, double z) {
+        double z2 = z * z, d = 1 + z2 / n;
+        double centre = (obs + z2 / (2 * n)) / d;
+        double half = z * Math.sqrt(obs * (1 - obs) / n + z2 / (4.0 * n * n)) / d;
+        return new double[]{Math.max(0, centre - half), Math.min(1, centre + half)};
+    }
+
+    static final DateTimeFormatter WEB_DAY = DateTimeFormatter.ofPattern("EEE d MMM yyyy", Locale.UK);
+
+    /** A short line for a prediction with its due date ("Still in the top 5 on Sat 7 Nov"). */
+    static String webClaim(Pred p) {
+        return claim(p) + " on " + p.due().format(DateTimeFormatter.ofPattern("EEE d MMM", Locale.UK));
+    }
+
+    static String feedXml(List<Pred> preds, Latest latest, boolean demo, String siteUrl) {
+        Map<LocalDate, List<Pred>> byDay = new TreeMap<>(Comparator.reverseOrder());
+        for (Pred p : preds) byDay.computeIfAbsent(p.made(), k -> new ArrayList<>()).add(p);
+        DateTimeFormatter rfc = DateTimeFormatter.RFC_1123_DATE_TIME;
+        StringBuilder x = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\">\n<channel>\n");
+        x.append("<title>Cassandra: news coverage forecasts").append(demo ? " (DEMO DATA)" : "").append("</title>\n")
+                .append("<link>").append(esc(siteUrl)).append("</link>\n")
+                .append("<description>Dated, probabilistic predictions about which stories will lead the news, "
+                        + "graded automatically and scored against a coin flip and a base-rate forecaster.")
+                .append(demo ? " These come from synthetic demo headlines, not real news." : "").append("</description>\n")
+                .append("<language>en-gb</language>\n")
+                .append("<lastBuildDate>").append(rfc.format(NOW.atZone(ZoneOffset.UTC))).append("</lastBuildDate>\n");
+        int n = 0;
+        for (var e : byDay.entrySet()) {
+            if (n++ >= 30) break;
+            LocalDate d = e.getKey();
+            Instant when = latest != null && latest.date().equals(d) ? latest.ranAt()
+                    : d.atTime(12, 0).toInstant(ZoneOffset.UTC);
+            StringBuilder body = new StringBuilder("<ul>");
+            for (Pred p : e.getValue())
+                body.append("<li>").append(esc(statement(p))).append(" <b>").append(pct(p.p())).append("</b>")
+                        .append(p.outcome().equals("PENDING") ? "" : " — " + esc(outcomeText(p).toLowerCase(Locale.ROOT)))
+                        .append("</li>");
+            body.append("</ul>");
+            x.append("<item>\n<title>Forecasts made on ").append(d.format(WEB_DAY)).append(": ")
+                    .append(e.getValue().size()).append(" predictions</title>\n")
+                    .append("<link>").append(esc(siteUrl)).append("</link>\n")
+                    .append("<guid isPermaLink=\"false\">cassandra-forecasts-").append(d).append("</guid>\n")
+                    .append("<pubDate>").append(rfc.format(when.atZone(ZoneOffset.UTC))).append("</pubDate>\n")
+                    .append("<description><![CDATA[").append(body.toString().replace("]]>", "]]&gt;"))
+                    .append("]]></description>\n</item>\n");
+        }
+        return x.append("</channel>\n</rss>").toString();
+    }
+
+    static String siteHtml(List<Pred> preds, Latest latest, Accuracy acc, Accuracy accSince, LocalDate since,
+                           String hash, boolean demo) {
+        Map<String, Pred> byId = new HashMap<>();
+        for (Pred p : preds) byId.put(p.id(), p);
+        StringBuilder h = new StringBuilder();
+        h.append("""
+                <!doctype html>
+                <html lang="en-GB">
+                <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Cassandra news forecasts</title>
+                <meta name="description" content="Dated, probabilistic predictions about which stories will lead the news, graded automatically and scored honestly.">
+                <link rel="alternate" type="application/rss+xml" title="Cassandra forecasts" href="feed.xml">
+                <style>
+                :root { --bg:#f7f7f5; --card:#ffffff; --ink:#1f2937; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb;
+                  --accent-soft:#dbe7fd; --good:#1e7b3a; --bad:#b42318; --warn-bg:#f9eeda; --warn:#8a5a00; --bar:#e8eaee;
+                  --good-bg:#e5f4e4; --bad-bg:#fbebeb; --grey-bg:#f0efec; }
+                @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --card:#1d2026; --ink:#e7e9ee; --muted:#9aa1ad;
+                  --line:#2d323b; --accent:#6b9bf5; --accent-soft:#25344f; --good:#5cc27a; --bad:#f07a6e; --warn-bg:#3a2f16;
+                  --warn:#f0c46b; --bar:#2d323b; --good-bg:#17301f; --bad-bg:#3a1d1b; --grey-bg:#262a31; } }
+                * { box-sizing: border-box; }
+                body { margin:0; background:var(--bg); color:var(--ink); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+                main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+                h1 { font-size: 1.9rem; margin: 0 0 4px; } h2 { font-size: 1.25rem; margin: 0 0 12px; } h3 { font-size: 1.05rem; margin: 0; }
+                .sub, .muted { color: var(--muted); } .small { font-size: .875rem; }
+                .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; margin: 16px 0; }
+                .demo { background: var(--warn-bg); color: var(--warn); border-radius: 10px; padding: 12px 16px; margin: 16px 0; font-weight: 600; }
+                .verdict { border-radius: 10px; padding: 14px 18px; margin: 0 0 14px; }
+                .verdict b { font-size: 1.2rem; display: block; }
+                .v-good { background: var(--good-bg); } .v-good b { color: var(--good); }
+                .v-bad { background: var(--bad-bg); } .v-bad b { color: var(--bad); }
+                .v-mid { background: var(--warn-bg); } .v-mid b { color: var(--warn); }
+                .v-early { background: var(--grey-bg); }
+                .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+                .tile { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+                .tile .v { font-size: 1.6rem; font-weight: 700; }
+                .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+                .story { border-top: 1px solid var(--line); padding: 14px 0; } .story:first-of-type { border-top: 0; padding-top: 4px; }
+                .badge { font-size: .75rem; font-weight: 600; background: var(--accent-soft); color: var(--accent); border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
+                .pred { display: grid; grid-template-columns: 1fr 120px 92px; gap: 10px; align-items: center; padding: 3px 0; }
+                .bar { height: 8px; background: var(--bar); border-radius: 4px; position: relative; }
+                .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); border-radius: 4px; }
+                .pct { font-weight: 700; font-variant-numeric: tabular-nums; }
+                .st { font-size: .85rem; } .st-true { color: var(--good); } .st-false { color: var(--bad); } .st-other { color: var(--muted); }
+                ul.heads { margin: 8px 0 0; padding-left: 18px; } ul.heads li { margin: 2px 0; }
+                a { color: var(--accent); }
+                table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+                th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+                th { color: var(--muted); font-weight: 600; } td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+                svg { width: 100%; height: auto; display: block; } svg text { fill: var(--muted); font: 11px system-ui, sans-serif; }
+                code { font-size: .85em; word-break: break-all; }
+                footer { color: var(--muted); font-size: .875rem; margin-top: 28px; }
+                @media (max-width: 560px) { .pred { grid-template-columns: 1fr 70px; } .pred .st { grid-column: 1 / -1; margin-top: -4px; } h1 { font-size: 1.5rem; } }
+                </style>
+                </head>
+                <body><main>
+                """);
+        h.append("<header><h1>Cassandra</h1><p class=\"sub\">A news forecaster that commits to dated predictions about which "
+                + "stories will lead the news, grades them automatically, and keeps an honest score.</p>");
+        h.append("<p class=\"small muted\">").append(latest != null ? "Latest run: " + esc(latest.date().format(LONG_UK)) + ". " : "")
+                .append("Page generated ").append(esc(NOW.atZone(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern(
+                        "d MMM yyyy HH:mm", Locale.UK)))).append(" UTC. Published since ").append(esc(since.format(WEB_DAY)))
+                .append(".</p></header>");
+        if (demo)
+            h.append("<div class=\"demo\">Demo data: these forecasts come from Cassandra's synthetic demo headlines, not real "
+                    + "news. They show what the page looks like, nothing more.</div>");
+
+        // ---- scorecard
+        h.append("<section class=\"card\"><h2>How accurate is she?</h2>");
+        String vClass, vHead, vText;
+        switch (acc.verdict()) {
+            case BEATING -> { vClass = "v-good"; vHead = "Beating the base rate";
+                vText = "Her probabilities carry information beyond “what usually happens”, by more than luck alone would easily explain."; }
+            case WORSE -> { vClass = "v-bad"; vHead = "Worse than the base rate";
+                vText = "Simply forecasting how often each type of claim usually comes true would do better. Treat her probabilities with suspicion."; }
+            case UNCLEAR -> { vClass = "v-mid"; vHead = "No clear edge over the base rate";
+                vText = "Any difference between her and the base-rate forecaster is within what luck alone could produce."; }
+            default -> { vClass = "v-early"; vHead = "Too early to judge";
+                vText = (acc.comparable().isEmpty() ? "No predictions can be compared with the base-rate forecaster yet" : "Only " + acc.comparable().size() + " predictions can be compared with the base-rate forecaster so far") + "; a verdict needs " + MIN_FOR_VERDICT + "."; }
+        }
+        h.append("<div class=\"verdict ").append(vClass).append("\"><b>").append(vHead).append("</b>").append(esc(vText));
+        if (acc.ci() != null)
+            h.append(String.format(Locale.ROOT, " Skill score %+.2f over %d comparable predictions (90%% interval %+.2f to %+.2f).",
+                    acc.skill(), acc.comparable().size(), acc.ci()[0], acc.ci()[1]));
+        h.append("</div><div class=\"tiles\">");
+        tile(h, "Predictions graded", String.valueOf(acc.graded().size()), acc.pending() + " pending, " + acc.voided() + " void");
+        tile(h, "Brier score", acc.graded().isEmpty() ? "–" : String.format(Locale.ROOT, "%.3f", acc.bCass()),
+                "0 is perfect; lower is better");
+        tile(h, "A coin flip would score", "0.250", "always saying 50%");
+        tile(h, "Skill vs base rate", num(acc.skill(), "%+.2f"), acc.ci() == null ? "provisional" : "above 0 beats the base rate");
+        h.append("</div>");
+        h.append("<p class=\"small muted\">The base-rate forecaster is the opponent that matters: for each prediction it simply "
+                + "says how often that type of claim had come true so far. Beating a coin flip is easy when most claims are "
+                + "usually true; beating the base rate means her reading of the news adds something.</p>");
+        h.append("<p class=\"small\"><b>Since publication</b> (").append(esc(since.format(WEB_DAY))).append("): ")
+                .append(esc(compareLine(accSince))).append(" Shown separately because once forecasts are public they can, "
+                        + "in principle, influence the coverage they predict.</p></section>");
+
+        // ---- latest forecasts
+        h.append("<section class=\"card\"><h2>Latest forecasts</h2>");
+        if (latest == null)
+            h.append("<p class=\"muted\">No run has been saved yet.</p>");
+        else {
+            h.append("<p class=\"small muted\">From the run on ").append(esc(latest.date().format(WEB_DAY))).append(", which read ")
+                    .append(latest.headlines()).append(" headlines. Each bar is her probability that the claim comes true.</p>");
+            for (SnapStory s : latest.stories()) {
+                h.append("<div class=\"story\"><h3>").append(s.rank()).append(". ").append(esc(s.label()))
+                        .append(s.isNew() ? "<span class=\"badge\">new today</span>" : "").append("</h3>")
+                        .append("<p class=\"small muted\" style=\"margin:2px 0 8px\">")
+                        .append(String.format(Locale.ROOT, "%.0f%% of headlines · %d articles · tone %s · momentum %s",
+                                s.share() * 100, s.articles(), s.tone().name().toLowerCase(Locale.ROOT), esc(s.momentum())))
+                        .append("</p>");
+                for (String id : latest.predictionIds()) {
+                    Pred p = byId.get(id);
+                    if (p == null || !p.term().equals(s.term())) continue;
+                    String st = p.outcome().equals("TRUE") ? "st-true" : p.outcome().equals("FALSE") ? "st-false" : "st-other";
+                    h.append("<div class=\"pred\" title=\"").append(esc(statement(p))).append("\"><span>").append(esc(webClaim(p)))
+                            .append("</span><span style=\"display:flex;align-items:center;gap:8px\"><span class=\"bar\" style=\"flex:1\"><i style=\"width:")
+                            .append(String.format(Locale.ROOT, "%.0f", p.p() * 100)).append("%\"></i></span><span class=\"pct\">")
+                            .append(pct(p.p())).append("</span></span><span class=\"st ").append(st).append("\">")
+                            .append(outcomeText(p)).append("</span></div>");
+                }
+                List<SnapArticle> links = s.headlines().stream()
+                        .filter(a -> a.link().startsWith("https://") || a.link().startsWith("http://")).limit(3).toList();
+                if (!links.isEmpty()) {
+                    h.append("<ul class=\"heads small\">");
+                    for (SnapArticle a : links)
+                        h.append("<li><a href=\"").append(esc(a.link())).append("\" rel=\"nofollow noopener\">").append(esc(a.title()))
+                                .append("</a> <span class=\"muted\">(").append(esc(a.source())).append(")</span></li>");
+                    h.append("</ul>");
+                }
+                h.append("</div>");
+            }
+        }
+        h.append("</section>");
+
+        // ---- charts
+        if (!acc.graded().isEmpty()) {
+            h.append("<section class=\"grid2\"><div class=\"card\" style=\"margin:0\"><h2>When she says X%, does it happen X% of the time?</h2>")
+                    .append(reliabilitySvg(acc))
+                    .append("<p class=\"small muted\">One dot per band of forecasts; on the dashed diagonal is perfectly "
+                            + "calibrated. Bars show a 90% range for the true rate; bigger dots hold more predictions.</p></div>")
+                    .append("<div class=\"card\" style=\"margin:0\"><h2>Brier score by week</h2>").append(weeklySvg(acc))
+                    .append("<p class=\"small muted\">Lower is better. Blue: Cassandra. Grey: the base-rate forecaster, on the "
+                            + "same predictions. Dashed: Cassandra before recalibration. Dotted: a coin flip.</p></div></section>");
+        }
+
+        // ---- recently graded
+        List<Pred> recent = preds.stream().filter(Pred::graded)
+                .sorted(Comparator.comparing(Cassandra::resolvedOn).reversed().thenComparing(Pred::id)).limit(20).toList();
+        if (!recent.isEmpty()) {
+            h.append("<section class=\"card\"><h2>Recently graded</h2><table><tr><th>Graded</th><th>Prediction</th>"
+                    + "<th class=\"num\">Forecast</th><th>Outcome</th></tr>");
+            for (Pred p : recent)
+                h.append("<tr><td>").append(esc(resolvedOn(p).format(DateTimeFormatter.ofPattern("d MMM", Locale.UK))))
+                        .append("</td><td>").append(esc(statement(p))).append("</td><td class=\"num\">").append(pct(p.p()))
+                        .append("</td><td class=\"").append(p.outcome().equals("TRUE") ? "st-true" : "st-false").append("\">")
+                        .append(outcomeText(p)).append("</td></tr>");
+            h.append("</table><p class=\"small muted\">Every prediction, graded or not, is in <a href=\"predictions.csv\">predictions.csv</a>.</p></section>");
+        }
+
+        // ---- verification
+        h.append("<section class=\"card\"><h2>Check it yourself</h2><ul>")
+                .append("<li><a href=\"predictions.csv\">predictions.csv</a>: every prediction Cassandra has made, with its "
+                        + "probability, due date and outcome.</li>")
+                .append("<li>Its SHA-256 fingerprint is <code>").append(hash).append("</code> (also in "
+                        + "<a href=\"predictions.sha256\">predictions.sha256</a>). Check a downloaded copy with "
+                        + "<code>shasum -a 256 -c predictions.sha256</code>.</li>")
+                .append("<li><a href=\"feed.xml\">RSS feed</a>: one item per day of forecasts.</li>")
+                .append("<li>When this site is published from a git repository, its commit history is a public, dated record "
+                        + "of every day's forecasts, so they can't be edited after the fact without it showing.</li></ul></section>");
+
+        h.append("<footer><p><b>What this is, and isn't.</b> Cassandra predicts news <i>coverage</i> (which stories will be in "
+                + "the headlines, how big they will be, what tone they will have), not the events themselves. Her probabilities "
+                + "start as educated guesses and are only as good as the scorecard above shows. Do not use them for financial, "
+                + "political or safety decisions.</p><p>Free and open source: <a href=\"").append(REPO_URL).append("\">")
+                .append(REPO_URL.replace("http://", "")).append("</a>. Written by Mario Gianota. MIT License.</p></footer>");
+        h.append("</main></body></html>");
+        return h.toString();
+    }
+
+    static final DateTimeFormatter LONG_UK = DateTimeFormatter.ofPattern("EEEE d MMMM yyyy", Locale.UK);
+
+    static void tile(StringBuilder h, String title, String value, String caption) {
+        h.append("<div class=\"tile\"><div class=\"small muted\">").append(esc(title)).append("</div><div class=\"v\">")
+                .append(esc(value)).append("</div><div class=\"small muted\">").append(esc(caption)).append("</div></div>");
+    }
+
+    static String reliabilitySvg(Accuracy a) {
+        int x0 = 52, y0 = 12, size = 274, x1 = x0 + size, y1 = y0 + size;
+        StringBuilder s = new StringBuilder("<svg viewBox=\"0 0 340 336\" role=\"img\" aria-label=\"Reliability diagram\">");
+        for (int t = 0; t <= 100; t += 20) {
+            double x = x0 + size * t / 100.0, y = y1 - size * t / 100.0;
+            s.append(String.format(Locale.ROOT, "<line x1=\"%d\" y1=\"%.1f\" x2=\"%d\" y2=\"%.1f\" stroke=\"var(--line)\"/>", x0, y, x1, y))
+                    .append(String.format(Locale.ROOT, "<line x1=\"%.1f\" y1=\"%d\" x2=\"%.1f\" y2=\"%d\" stroke=\"var(--line)\"/>", x, y0, x, y1))
+                    .append(String.format(Locale.ROOT, "<text x=\"%d\" y=\"%.1f\" text-anchor=\"end\">%d%%</text>", x0 - 6, y + 4, t))
+                    .append(String.format(Locale.ROOT, "<text x=\"%.1f\" y=\"%d\" text-anchor=\"middle\">%d%%</text>", x, y1 + 16, t));
+        }
+        s.append(String.format(Locale.ROOT, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"var(--muted)\" stroke-dasharray=\"5 4\"/>", x0, y1, x1, y0));
+        s.append(String.format(Locale.ROOT, "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\">Forecast probability</text>", (x0 + x1) / 2, y1 + 34));
+        s.append(String.format(Locale.ROOT, "<text transform=\"translate(12 %d) rotate(-90)\" text-anchor=\"middle\">How often it came true</text>", (y0 + y1) / 2));
+        int maxN = a.bins().stream().mapToInt(Bin::n).max().orElse(1);
+        StringBuilder path = new StringBuilder();
+        for (Bin b : a.bins()) {
+            if (b.n() == 0) continue;
+            path.append(path.length() == 0 ? "M" : " L").append(String.format(Locale.ROOT, "%.1f %.1f",
+                    x0 + size * b.avgForecast(), y1 - size * b.observed()));
+        }
+        s.append("<path d=\"").append(path).append("\" fill=\"none\" stroke=\"var(--accent)\" stroke-opacity=\".45\" stroke-width=\"1.5\"/>");
+        for (Bin b : a.bins()) {
+            if (b.n() == 0) continue;
+            double px = x0 + size * b.avgForecast(), py = y1 - size * b.observed();
+            double[] ci = wilsonInterval(b.observed(), b.n(), 1.645);
+            double r = 4 + 9 * Math.sqrt(b.n() / (double) maxN);
+            s.append(String.format(Locale.ROOT, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"var(--accent)\" stroke-width=\"1.5\"/>",
+                    px, y1 - size * ci[0], px, y1 - size * ci[1]))
+                    .append(String.format(Locale.ROOT, "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"%.1f\" fill=\"%s\" stroke=\"var(--accent)\" stroke-width=\"1.5\">"
+                            + "<title>Forecasts of %.0f-%.0f%%: %d predictions, average %.0f%%, came true %.0f%%</title></circle>",
+                            px, py, r, b.n() >= 5 ? "var(--accent)" : "var(--card)", b.lo() * 100, b.hi() * 100, b.n(),
+                            b.avgForecast() * 100, b.observed() * 100));
+        }
+        return s.append("</svg>").toString();
+    }
+
+    static String weeklySvg(Accuracy a) {
+        List<WeekRow> w = a.weeks().stream().filter(r -> r.comparable() > 0).toList();
+        if (w.size() < 2) return "<p class=\"muted\">Not enough weeks of comparable predictions yet to draw a trend.</p>";
+        int x0 = 44, x1 = 460, y0 = 12, y1 = 232;
+        double max = 0.25;
+        for (WeekRow r : w) max = Math.max(max, Math.max(r.compBrier(), Math.max(r.compRaw(), r.compBase())));
+        double ymax = Math.ceil(max / 0.05) * 0.05;
+        java.util.function.IntToDoubleFunction X = i -> x0 + 10 + (x1 - x0 - 20) * (w.size() == 1 ? 0.5 : i / (double) (w.size() - 1));
+        java.util.function.DoubleUnaryOperator Y = v -> y1 - (y1 - y0) * v / ymax;
+        StringBuilder s = new StringBuilder("<svg viewBox=\"0 0 480 262\" role=\"img\" aria-label=\"Brier score by week\">");
+        for (double t = 0; t <= ymax + 1e-9; t += 0.05)
+            s.append(String.format(Locale.ROOT, "<line x1=\"%d\" y1=\"%.1f\" x2=\"%d\" y2=\"%.1f\" stroke=\"var(--line)\"/><text x=\"%d\" y=\"%.1f\" text-anchor=\"end\">%.2f</text>",
+                    x0, Y.applyAsDouble(t), x1, Y.applyAsDouble(t), x0 - 6, Y.applyAsDouble(t) + 4, t));
+        s.append(String.format(Locale.ROOT, "<line x1=\"%d\" y1=\"%.1f\" x2=\"%d\" y2=\"%.1f\" stroke=\"var(--muted)\" stroke-dasharray=\"2 3\"/>",
+                x0, Y.applyAsDouble(0.25), x1, Y.applyAsDouble(0.25)));
+        int every = Math.max(1, (int) Math.ceil(w.size() / 7.0));
+        for (int i = 0; i < w.size(); i++)
+            if (i % every == 0 || i == w.size() - 1)
+                s.append(String.format(Locale.ROOT, "<text x=\"%.1f\" y=\"%d\" text-anchor=\"middle\">%s</text>", X.applyAsDouble(i), y1 + 18,
+                        w.get(i).week().format(DateTimeFormatter.ofPattern("d MMM", Locale.UK))));
+        Object[][] series = {{(java.util.function.ToDoubleFunction<WeekRow>) WeekRow::compRaw, "var(--accent)", "stroke-dasharray=\"5 4\" stroke-opacity=\".55\"", 1.5},
+                {(java.util.function.ToDoubleFunction<WeekRow>) WeekRow::compBase, "var(--muted)", "", 2.0},
+                {(java.util.function.ToDoubleFunction<WeekRow>) WeekRow::compBrier, "var(--accent)", "", 2.5}};
+        for (Object[] se : series) {
+            @SuppressWarnings("unchecked")
+            java.util.function.ToDoubleFunction<WeekRow> f = (java.util.function.ToDoubleFunction<WeekRow>) se[0];
+            StringBuilder p = new StringBuilder();
+            for (int i = 0; i < w.size(); i++)
+                p.append(i == 0 ? "M" : " L").append(String.format(Locale.ROOT, "%.1f %.1f", X.applyAsDouble(i), Y.applyAsDouble(f.applyAsDouble(w.get(i)))));
+            s.append("<path d=\"").append(p).append("\" fill=\"none\" stroke=\"").append(se[1]).append("\" stroke-width=\"")
+                    .append(se[3]).append("\" ").append(se[2]).append("/>");
+        }
+        for (int i = 0; i < w.size(); i++) {
+            WeekRow r = w.get(i);
+            s.append(String.format(Locale.ROOT, "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"3.5\" fill=\"var(--accent)\"><title>Week of %s: Cassandra %.3f, base rate %.3f (%d predictions)</title></circle>",
+                    X.applyAsDouble(i), Y.applyAsDouble(r.compBrier()), r.week().format(WEB_DAY), r.compBrier(), r.compBase(), r.comparable()));
+        }
+        return s.append("</svg>").toString();
+    }
+
     // ------------------------------------------------------------------ run lock
 
     static final String LOCK = "cassandra.lock";
@@ -1588,7 +2109,8 @@ public class Cassandra {
                 if (c.length < 11) continue;
                 try {
                     out.add(new Pred(c[0], LocalDate.parse(c[1]), LocalDate.parse(c[2]), c[3], c[4], c[5], c[6],
-                            Double.parseDouble(c[7]), Double.parseDouble(c[8]), c[9], c[10]));
+                            Double.parseDouble(c[7]), Double.parseDouble(c[8]), c[9], c[10],
+                            c.length > 11 ? c[11] : ""));   // older files have no evidence column
                 } catch (RuntimeException ignored) { /* skip malformed line */ }
             }
         } catch (IOException e) {
@@ -1621,7 +2143,7 @@ public class Cassandra {
         for (Pred x : preds)
             p.add(String.join("\t", x.id(), x.made().toString(), x.due().toString(), x.term(), x.label(), x.kind(),
                     x.param(), String.format(Locale.ROOT, "%.4f", x.pRaw()),
-                    String.format(Locale.ROOT, "%.4f", x.p()), x.outcome(), x.resolved()));
+                    String.format(Locale.ROOT, "%.4f", x.p()), x.outcome(), x.resolved(), x.features()));
         writeAtomically(dir.resolve("predictions.tsv"), p);
     }
 
@@ -1668,8 +2190,17 @@ public class Cassandra {
             case "accelerating" -> "Because coverage is accelerating, developments are likely to arrive faster than usual.";
             case "fading" -> "Because coverage is fading, the story may slip from the headlines unless a new development revives it.";
             case "steady" -> "Coverage is steady, so expect a gradual rather than abrupt progression.";
-            default -> "There is too little timing data to say whether the pace will quicken or slow.";
+            case "new" -> "As a new story, it may grow quickly over the next few days or vanish just as fast.";
+            default -> "There is not yet enough daily history to say whether the pace will quicken or slow.";
         };
+    }
+
+    /** How a prediction's probability was arrived at, for the report. */
+    static String startingPoint(Pred p) {
+        String b = p.feature("b");
+        if (b != null)
+            return " [from the base rate of " + pct(Double.parseDouble(b)) + "; first guess " + pct(p.pRaw()) + "]";
+        return Math.abs(p.p() - p.pRaw()) > 1e-9 ? " [recalibrated from " + pct(p.pRaw()) + "]" : "";
     }
 
     /** Each row = one time horizon; column 0 = negative-leaning, column 1 = positive-leaning. */
@@ -2199,7 +2730,10 @@ public class Cassandra {
             ProbBar(Pred p) {
                 this.p = p;
                 setPreferredSize(new Dimension(122, 18));
-                setToolTipText(Math.abs(p.p() - p.pRaw()) > 1e-9
+                setToolTipText(p.feature("b") != null
+                        ? "Started from the base rate for this type (" + pct(Double.parseDouble(p.feature("b")))
+                        + "), adjusted for the evidence; her first guess was " + pct(p.pRaw())
+                        : Math.abs(p.p() - p.pRaw()) > 1e-9
                         ? "Recalibrated from " + pct(p.pRaw()) + " using her track record for this type"
                         : "Her probability that this comes true");
             }
@@ -2648,18 +3182,6 @@ public class Cassandra {
 
         static String describeType(String key) {
             return typeLabel(key) + "  (" + key + ")";
-        }
-
-        /** A prediction type ("TOP5@3") in words, without the code. */
-        static String typeLabel(String key) {
-            String[] k = key.split("@");
-            String what = switch (k[0]) {
-                case "TOP5" -> "Still in the top 5";
-                case "SHARE_UP" -> "Larger share of headlines";
-                case "TONE_PERSIST" -> "Tone stays the same";
-                default -> k[0];
-            };
-            return what + " after " + (k.length > 1 ? k[1] : "?") + " days";
         }
 
         // ---------------------------------------------------------------- Story history tab
@@ -3147,26 +3669,6 @@ public class Cassandra {
 
         // ---------------------------------------------------------------- Predictions tab
 
-        static String outcomeText(Pred p) {
-            return switch (p.outcome()) {
-                case "TRUE" -> "Came true";
-                case "FALSE" -> "Didn't happen";
-                case "VOID" -> "Void";
-                default -> "Pending";
-            };
-        }
-
-        /** What a prediction claims, without its date (the table has a Due column). */
-        static String claim(Pred p) {
-            return switch (p.kind()) {
-                case "TOP5" -> "Still in the top 5";
-                case "SHARE_UP" -> "Bigger share than "
-                        + String.format(Locale.ROOT, "%.0f%%", Double.parseDouble(p.param()) * 100);
-                case "TONE_PERSIST" -> "Coverage still " + (p.param().equals("NEG") ? "negative" : "positive");
-                default -> p.kind();
-            };
-        }
-
         /**
          * Every prediction Cassandra has made, in a sortable, filterable, read-only table. It is built once
          * and given fresh data on each reload, so filters, sorting and scroll position survive a scheduled run.
@@ -3380,22 +3882,9 @@ public class Cassandra {
                 }
             }
 
-            /** Write predictions as CSV (RFC 4180 quoting). Returns how many were written. */
+            /** Write predictions as CSV. Returns how many were written. */
             static int exportCsv(Path target, List<Pred> ps) throws IOException {
-                List<String> lines = new ArrayList<>();
-                lines.add("id,made,due,story,term,type,claim,statement,probability,probability_before_recalibration,"
-                        + "outcome,graded_on");
-                for (Pred p : ps)
-                    lines.add(String.join(",", csv(p.id()), p.made().toString(), p.due().toString(), csv(p.label()),
-                            csv(p.term()), csv(p.key()), csv(claim(p)), csv(statement(p)),
-                            String.format(Locale.ROOT, "%.4f", p.p()), String.format(Locale.ROOT, "%.4f", p.pRaw()),
-                            csv(outcomeText(p)), p.resolved().equals("-") ? "" : p.resolved()));
-                Files.write(target, lines, StandardCharsets.UTF_8);
-                return ps.size();
-            }
-
-            static String csv(String s) {
-                return s.contains(",") || s.contains("\"") || s.contains("\n") ? "\"" + s.replace("\"", "\"\"") + "\"" : s;
+                return writePredictionsCsv(target, ps);
             }
         }
 
@@ -3709,7 +4198,7 @@ public class Cassandra {
         }
 
         static final String VERSION = "2.0";
-        static final String REPO = "http://github.com/RDMachinery/Cassandra";
+        static final String REPO = REPO_URL;
 
         void showAbout() {
             JEditorPane text = new JEditorPane("text/html", "<html><body style='font-family: sans-serif'>"
