@@ -52,7 +52,7 @@ Her predictions are about **news coverage** (what will be in the headlines), not
 
 ## Is she any good?
 
-**On real news, nobody knows yet.** A fair answer needs several weeks of daily runs, and her live record is only just starting. This section will be updated with the real figures when there are enough of them.
+**On real news, nobody knows yet.** A fair answer needs several weeks of daily runs, and her live record is only just starting. This section will be updated with the real figures when there are enough of them. As of 26 October 2026 I have had Cassandra running for about 7 days. In another, 28 days there will be enough data to properly answer this question.
 
 What can be said is how she's judged, and that the test is deliberately hard to pass. Her predictions are compared with two simple opponents:
 
