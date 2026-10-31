@@ -1,6 +1,6 @@
 # Cassandra: technical guide
 
-The detail behind the [README](../README.md): how Cassandra is scored, how a run works, the files she saves, every setting, the command-line options, replay, publishing, the self-test and the version history.
+The detail behind the [README](../README.md): how Cassandra is scored, how a run works, the files she saves, every setting, the command-line options, replay, publishing and the version history.
 
 ## Contents
 
@@ -12,11 +12,10 @@ The detail behind the [README](../README.md): how Cassandra is scored, how a run
 6. [The desktop window in detail](#the-desktop-window-in-detail)
 7. [Replay](#replay)
 8. [Publishing on GitHub Pages](#publishing-on-github-pages)
-9. [Self-test](#self-test)
-10. [Known limitations](#known-limitations)
-11. [Roadmap](#roadmap)
-12. [Contributing](#contributing)
-13. [Version history](#version-history)
+9. [Known limitations](#known-limitations)
+10. [Roadmap](#roadmap)
+11. [Contributing](#contributing)
+12. [Version history](#version-history)
 
 ## How she is scored
 
@@ -37,61 +36,73 @@ To stop the report flattering her:
 - **No verdict until there is evidence.** The base-rate forecaster needs 5 earlier results of a type before it makes a forecast, and the report gives no verdict until 30 predictions can be compared.
 - **An honest margin of error.** The 90% interval on the skill score is bootstrapped by resampling *whole days*, because predictions made on the same day are about the same stories and tend to succeed or fail together.
 - **Three possible verdicts:** she beats the base rate (the whole interval is above 0), she is worse (the whole interval is below 0), or she cannot yet be told apart from it.
-- **Where she goes wrong.** A reliability table shows, for each band of forecasts (0–20%, 20–40% …), how often those claims actually came true.
+- **Where she goes wrong.** A reliability table shows, for each band of forecasts (0–20%, 20–40% …), how often those claims actually came true. A gap of more than 10 points is flagged, with "(could be chance)" added when it is smaller than two standard errors for that many results.
 
 
 ### What the report looks like
 
-Abridged output after 35 days of `--demo` runs (synthetic headlines, not real news):
+Abridged output after 35 days of `--demo` runs (synthetic headlines, not real news; see [Try the learning loop offline](#try-the-learning-loop-offline) to reproduce it):
 
 ```
 THE SHORT ANSWER
-  Cassandra is doing WORSE than simply forecasting how often each type of claim usually
-  comes true. Treat her probabilities with suspicion.
-  Skill score -0.04 over 237 comparable predictions (90% interval -0.08 to -0.01). 0 means
+  Cassandra cannot yet be told apart from the base-rate forecaster: any edge she has is
+  within the range that luck alone could produce.
+  Skill score +0.01 over 310 comparable predictions (90% interval -0.01 to +0.02). 0 means
   no better than the base rate, 1 would be perfect, below 0 is worse.
 
 BRIER SCORES (lower is better; 0 is perfect)
-  All 294 graded predictions:
-    Cassandra (issued probabilities)    0.164
-    Cassandra before recalibration      0.207
+  All 382 graded predictions:
+    Cassandra (issued probabilities)    0.224
+    Cassandra before recalibration      0.241
     Coin flip (always 50%)              0.250
-  The 237 predictions the base-rate forecaster could also make:
-    Cassandra                           0.159
-    Base-rate forecaster                0.153
+  The 310 predictions the base-rate forecaster could also make:
+    Cassandra                           0.223
+    Base-rate forecaster                0.225
 
 BY PREDICTION TYPE
   type             graded  came true  avg forecast   Brier   skill vs base rate
-  SHARE_UP@3           80        36%           38%   0.250   -0.10 (on 68)
-  TONE_PERSIST@3       62        95%           91%   0.063   +0.02 (on 52)
-  TOP5@3               80        85%           86%   0.142   -0.02 (on 68)
-  TOP5@7               72        83%           79%   0.181   +0.02 (on 49)
+  LEAD@3               32        38%           45%   0.239   +0.02 (on 25)
+  RISE@3               13        54%           37%   0.276   +0.19 (on 7)
+  SHARE_UP@3           96        26%           29%   0.198   +0.01 (on 84)
+  TONE_HOLDS@3         61        77%           81%   0.196   -0.01 (on 50)
+  TOP5@3               96        70%           76%   0.223   +0.00 (on 84)
+  TOP5@7               84        60%           62%   0.261   -0.01 (on 60)
 
 RELIABILITY (when she says X%, does it happen X% of the time?)
   forecast  graded  avg forecast  came true  verdict
-  0-20%          6           15%        33%  forecasts too low by 19 pts
-  20-40%        42           34%        50%  forecasts too low by 16 pts
-  40-60%        49           47%        45%  well calibrated
-  60-80%        30           69%        87%  forecasts too low by 17 pts
-  80-100%      167           92%        87%  well calibrated
+  0-20%          3           14%        33%  too few to judge
+  20-40%       100           28%        29%  well calibrated
+  40-60%        57           48%        51%  well calibrated
+  60-80%       158           71%        65%  well calibrated
+  80-100%       64           85%        72%  forecasts too high by 14 pts
 
 BRIER SCORE BY WEEK (week starting, by date graded)
   week of      graded  Cassandra  before recal  Cassandra vs base rate
-  2026-10-05      61      0.158         0.180  0.141 vs 0.136 (on 23)
-  2026-10-12      69      0.192         0.226  0.182 vs 0.157 (on 55)
-  2026-10-19      70      0.138         0.196  0.138 vs 0.133 (on 70)
-  2026-10-26      61      0.186         0.234  0.186 vs 0.191 (on 61)
+  2026-09-28       9      0.238         0.238  n/a
+  2026-10-05      77      0.181         0.212  0.152 vs 0.152 (on 32)
+  2026-10-12      89      0.262         0.262  0.256 vs 0.252 (on 71)
+  2026-10-19      89      0.208         0.212  0.208 vs 0.210 (on 89)
+  2026-10-26      82      0.246         0.287  0.246 vs 0.250 (on 82)
+  2026-11-02      36      0.208         0.226  0.208 vs 0.215 (on 36)
 ```
 
 How to read this demo result:
 
-- **She beats a coin flip easily** (0.164 against 0.250), which would look impressive on its own.
-- **She is just short of the base rate** (skill −0.04), and the interval says this is not bad luck. That is the right answer for the demo: its headlines are random draws from a fixed set, so there is nothing to read beyond how often each kind of claim usually comes true. Starting every probability from the base rate brings her close to it; refining it by rank, momentum or trend can only add noise when there is no real signal. The report is not rigged in her favour.
-- **`SHARE_UP` is still her weakest prediction** (skill −0.10). Day-to-day swings in a story's share of coverage are hard to call.
-- **Learning from her record helps a lot:** her hand-set first guesses would have scored 0.207; the probabilities she actually issued scored 0.164.
-- **For comparison, before probabilities started from the base rate** (and before the momentum fix) the same 35 days gave a skill of −0.17 and a Brier score of 0.178, with claims rated under 20% coming true 45% of the time.
+- **She is level with the base rate** (skill +0.01, interval −0.01 to +0.02). That is the right answer for the demo: its headlines are random draws following fixed storylines, so there is little to read beyond how often each kind of claim usually comes true. The report is not rigged in her favour.
+- **She only just beats a coin flip** (0.224 against 0.250). The demo has more stories than it used to, so fewer of her claims are near-certain, and a coin flip is harder to beat.
+- **Some numbers rest on very few results.** `RISE@3`'s +0.19 is from 7 comparable predictions, and the 80–100% band's shortfall from 64; treat both as noise until there are many more.
+- **Learning from her record helps:** her hand-set first guesses would have scored 0.241; the probabilities she actually issued scored 0.224.
+- **Making the evidence earn its weight** is what keeps her level with the base rate. The same code with the evidence always fully trusted gives:
 
-Whether the evidence she uses (rank, momentum, trend, tone strength) carries real information can only be shown on real headlines. Replaying the archive after a few weeks of live runs will tell.
+  | Demo days | Evidence always trusted | Evidence earns its weight |
+  |---|---|---|
+  | 35, from 1 Oct (this report) | +0.01 (−0.01 to +0.04) | +0.01 (−0.01 to +0.02) |
+  | 41, from 1 Sep | −0.04 (−0.07 to −0.01) | −0.00 (−0.02 to +0.01) |
+  | 70, from 1 Sep | −0.03 (−0.05 to −0.01) | −0.00 (−0.02 to +0.01) |
+
+  Fully trusted evidence made her measurably *worse* than the base rate in two of the three periods. Earning its weight, it never costs her more than luck explains.
+
+Whether the evidence she uses (rank, momentum, trend, tone strength, the gap to the runner-up) carries real information can only be shown on real headlines. The `w=` weights will show it as they grow or shrink, and replaying the archive after a few weeks of live runs will tell more.
 
 ### Producing a real track record
 
@@ -111,19 +122,25 @@ java Cassandra --report
 2. **Rank stories.** Words are tokenised, stopwords removed and plurals stemmed. Each term appearing in at least three articles scores `articles + 1.5 × (outlets − 1) + headline hits`. Terms whose articles overlap by more than 60% are merged into one story.
 3. **Measure.** For each of the top 3 stories: tone is the average of (positive − negative lexicon words) per article, and momentum compares today's share of headlines with the story's average over the previous 3 days of runs (accelerating or fading needs a change of at least 3 points and 30%; a story absent from those runs is new). For the dominant story, the domain is the keyword lexicon with the most hits.
 4. **Trend.** Each run saves the top 10 stories and their share of coverage. For each leading story, a least-squares line is fitted through its share from the first day it appeared in the top 10 (within the last 14 days) up to today, giving a projected share with a prediction interval. Days before it appeared are ignored; a day it drops out of the top 10 after appearing counts as a negligible share. At least 3 days of data are needed.
-5. **Predict.** Up to four predictions are logged about each of the top 3 stories:
+5. **Predict.** Up to four predictions are logged about each of the top 3 stories, one more about the leading story, and one about each of up to 2 *challengers*:
 
-   | Type | Claim | Horizon |
-   |---|---|---|
-   | `TOP5` | It will still be among the top 5 stories | 3 and 7 days |
-   | `SHARE_UP` | Its share of headlines will be higher than today | 3 days |
-   | `TONE_PERSIST` | Its coverage will still be clearly negative (or positive); skipped when tone is mixed | 3 days |
+   | Type | About | Claim | Horizon |
+   |---|---|---|---|
+   | `TOP5` | Top 3 stories | It will still be among the top 5 stories | 3 and 7 days |
+   | `SHARE_UP` | Top 3 stories | Its share of headlines will be higher than today | 3 days |
+   | `TONE_HOLDS` | Top 3 stories | It will still be in the news (3+ headlines) and its coverage still clearly negative (or positive); skipped when tone is mixed | 3 days |
+   | `LEAD` | The leading story | It will still be the leading story | 3 days |
+   | `RISE` | Challengers | It will have broken into the top 5 | 3 days |
 
-   Each prediction records the evidence it was made on: rank and momentum for `TOP5`, the trend's direction (up, flat, down or none) and momentum for `SHARE_UP`, and tone strength for `TONE_PERSIST`. Its probability comes from the record:
+   **Challengers** are the stories ranked 6 to 10 whose share of headlines has grown most against their average over the previous 3 days of runs (a story new to the top 10 counts as growing from nothing). To count, a story must be named in at least two headlines, and a lone tone word such as "warn" or "rise" is skipped, because words like these are a way of writing headlines rather than a story.
 
-   - **Once the type has 5 graded results,** it starts at the type's base rate (how often its claims have come true so far) and is refined through each piece of evidence in turn: the rate among earlier predictions that shared it, blended with the previous step as `(hits + 10 × previous) / (results + 10)`. Evidence that has made no difference so far moves nothing; evidence that has, moves the probability as far as its record supports.
-   - **Before that,** her hand-set first guess is used (from rank, momentum, days in the top 5, tone strength, or the trend), recalibrated as below.
-6. **Grade.** On the first run on or after a prediction's due date (within a 2-day grace period), it is marked true or false. Predictions that cannot be graded (for example, the story vanished before tone could be measured, or no run happened within the grace period) are voided and excluded from all scores.
+   Each prediction records the evidence it was made on: rank and momentum for `TOP5` and `RISE`, the trend's direction (up, flat, down or none) and momentum for `SHARE_UP`, tone strength and momentum for `TONE_HOLDS`, and for `LEAD` momentum and the gap to the runner-up (*wide* when the leader's share is at least 1.5 times the runner-up's, otherwise *close*). Its probability comes from the record:
+
+   - **Once the type has 5 graded results,** she works out two numbers. The **base rate** is how often the type's claims have come true so far. The **evidence-based probability** refines it through each piece of evidence in turn: the rate among earlier predictions that shared it, blended with the previous step as `(hits + 10 × previous) / (results + 10)`.
+   - **The evidence has to earn its weight.** Every prediction records both numbers (`b=` and `e=` in its evidence column), so once a type has 20 graded results carrying both, she can score them against each other on the same questions. The probability she issues is `base + w × (evidence − base)`, where the weight `w` is 0.5 plus five times the evidence's relative Brier advantage, kept between 0 and 1: evidence 10% better than the base rate gets full weight, evidence 10% worse gets none. Until there are 20 results, `w` is 0.5. The weight is recorded too (`w=`), and the report shows all three, e.g. `-> 74% [base rate 81%, evidence says 69%, trusted 42%]`.
+   - **Before that,** her hand-set first guess is used (from rank, momentum, days in the top 5, tone strength, the gap to the runner-up, or the trend), recalibrated as below.
+   - Probabilities are kept between 1% and 99%, the same range the base-rate forecaster can reach.
+6. **Grade.** On the first run on or after a prediction's due date (within a 2-day grace period), it is marked true or false. A `TONE_HOLDS` claim about a story that has faded below 3 headlines is false: the story is no longer in the news. Predictions that cannot be graded (no run happened within the grace period, or an old `TONE_PERSIST` claim whose story vanished before tone could be measured) are voided and excluded from all scores.
 7. **Calibrate.** Her first guess is always stored alongside the probability she issued, so the report can show what learning from her record has gained ("before recalibration"). While a type has too few results for the base rate, the first guess is recalibrated: her average forecast is compared with how often the claims came true and shifted in logit space to close the gap, weighted by `n / (n + 10)`.
 8. **Score.** Each run's track record gives Brier scores per type and the skill score against the base-rate forecaster. `--report` adds the interval, verdict, reliability table and weekly scores described in [How she is scored](#how-she-is-scored).
 9. **Narrate.** Hand-written causal templates for the dominant story's domain and tone are filled in for days, weeks and months, with the opposite tone offered as an alternative branch.
@@ -134,44 +151,58 @@ Abridged output from the fourth run of the four-day loop in [Try the learning lo
 
 ```
 COVERAGE FORECAST (share of headlines mentioning this story)
-  Trend over 4 days of data (since 2026-10-01): -3.8 percentage points per day. Today 44%.
-  In 3 days: about 27% (80% range 7%-47%)
-  In 7 days: about 12% (80% range 0%-46%)
+  Trend over 4 days of data (since 2026-10-01): -1.9 percentage points per day. Today 26%.
+  In 3 days: about 18% (80% range 10%-27%)
+  In 7 days: about 11% (80% range 0%-26%)
 
-PREDICTIONS FOR THE TOP 2 STORIES (logged and graded when due)
-  1. "port strike" - 44% of coverage
+PREDICTIONS FOR THE TOP 3 STORIES (logged and graded when due)
+  1. "port strike" - 26% of coverage
      - By 2026-10-07, "port strike" will still be among the top 5 stories.  -> 77%
      - By 2026-10-11, "port strike" will still be among the top 5 stories.  -> 62%
      - By 2026-10-07, "port strike" will take a larger share of headlines than on
-       2026-10-04 (44%).  -> 23%
-     - On 2026-10-07, coverage of "port strike" will still be clearly negative in tone.
-       -> 72%
-  2. "storm" - 25% of coverage
-     - By 2026-10-07, "storm" will still be among the top 5 stories.  -> 70%
-     - By 2026-10-11, "storm" will still be among the top 5 stories.  -> 55%
-     - By 2026-10-07, "storm" will take a larger share of headlines than on 2026-10-04
-       (25%).  -> 55%
+       2026-10-04 (26%).  -> 20%
+     - On 2026-10-07, "port strike" will still be in the news (3+ headlines) and its
+       coverage still clearly negative.  -> 72%
+     - By 2026-10-07, "port strike" will still be the leading story.  -> 65%
+  2. "reservoir" - 15% of coverage
+     - By 2026-10-07, "reservoir" will still be among the top 5 stories.  -> 70%
+     - By 2026-10-11, "reservoir" will still be among the top 5 stories.  -> 55%
+     - By 2026-10-07, "reservoir" will take a larger share of headlines than on 2026-10-04
+       (15%).  -> 49%
+  ...
 
 GRADED TODAY
   - [CAME TRUE] By 2026-10-04, "port strike" will still be among the top 5 stories.
   (forecast 62%)
   - [DID NOT HAPPEN] By 2026-10-04, "port strike" will take a larger share of headlines
-  than on 2026-10-01 (53%). (forecast 42%)
+  than on 2026-10-01 (30%). (forecast 42%)
+  - [CAME TRUE] On 2026-10-04, "port strike" will still be in the news (3+ headlines) and
+  its coverage still clearly negative. (forecast 72%)
+  - [CAME TRUE] By 2026-10-04, "port strike" will still be the leading story. (forecast
+  53%)
   - [DID NOT HAPPEN] By 2026-10-04, "ai chip" will still be among the top 5 stories.
   (forecast 55%)
+  - [DID NOT HAPPEN] By 2026-10-04, "ai chip" will take a larger share of headlines than
+  on 2026-10-01 (17%). (forecast 42%)
+  - [DID NOT HAPPEN] On 2026-10-04, "ai chip" will still be in the news (3+ headlines) and
+  its coverage still clearly positive. (forecast 66%)
+  ...
 
 CASSANDRA'S TRACK RECORD
   type             graded  came true  avg forecast  Brier (lower is better)
-  SHARE_UP@3            2         0%           42%  0.176
-  TONE_PERSIST@3        1       100%           72%  0.078
-  TOP5@3                2        50%           59%  0.223
-  Overall Brier score 0.176 over 5 graded predictions (a coin-flip forecaster scores
-  0.250; a perfect one 0.000). Cassandra is currently beating a coin flip. Pending: 29.
+  LEAD@3                1       100%           53%  0.221
+  SHARE_UP@3            3        33%           42%  0.230
+  TONE_HOLDS@3          2        50%           69%  0.257
+  TOP5@3                3        67%           55%  0.239
+  Overall Brier score 0.238 over 9 graded predictions (a coin-flip forecaster scores
+  0.250; a perfect one 0.000). Cassandra is currently beating a coin flip. Pending: 39.
   Too early to compare her with a base-rate forecaster (0 of 30 comparable predictions).
   Run with --report for details.
 ```
 
-"Top 2" rather than 3 here because only two stories had enough coverage that day. This early on, no prediction type has 5 graded results yet, so these are her first guesses; later runs show `[from the base rate of …]` beside each probability.
+This early on, no prediction type has 5 graded results yet, so these are her first guesses; later runs show `[base rate …, evidence says …, trusted …]` beside each probability. On days when a story ranked 6 to 10 is growing fast, a **CHALLENGERS** section follows the predictions, with one `RISE` prediction for each.
+
+Note the "ai chip" tone prediction: the story had faded below 3 headlines by 4 October, so "still in the news and still positive" is graded as didn't happen. Before `TONE_HOLDS`, a claim like this was voided and left out of her score.
 
 ## Command-line reference
 
@@ -193,11 +224,10 @@ java Cassandra --replay=DIR --data=OUT   # ... into OUT, with OUT's cassandra.pr
 java Cassandra --publish=SITE        # run, then write a static website of her forecasts into SITE
 java Cassandra --publish-only=SITE   # write the website from saved results, without running
 java Cassandra --publish=SITE --site-url=URL   # URL is the site's address, used in the RSS feed
-java Cassandra --selftest            # run the built-in checks; exit status 0 if all pass
 java Cassandra --help
 ```
 
-**Requirements:** Java 16 or later; an internet connection for live feeds (not needed for `--demo`, `--report`, `--gui` or `--selftest`); a desktop session for `--gui` (everything else runs headless, e.g. from cron). Pure JDK: no Maven, no Gradle, no third-party libraries.
+**Requirements:** Java 16 or later; an internet connection for live feeds (not needed for `--demo`, `--report` or `--gui`); a desktop session for `--gui` (everything else runs headless, e.g. from cron). Pure JDK: no Maven, no Gradle, no third-party libraries.
 
 ### Try the learning loop offline
 
@@ -229,7 +259,7 @@ Plain-text files in the data directory (default `./cassandra-data`):
 | File | Contents |
 |---|---|
 | `history.tsv` | date, term, rank, article count, total articles, net sentiment |
-| `predictions.tsv` | id, made, due, term, label, kind, param, first guess, issued probability, outcome, resolved on, evidence (e.g. `r=2;m=steady;b=0.8500`: rank, momentum, and the base rate it started from; empty for older predictions) |
+| `predictions.tsv` | id, made, due, term, label, kind, param, first guess, issued probability, outcome, resolved on, evidence (e.g. `r=2;m=steady;b=0.8500;e=0.8800;w=0.50`: rank, momentum, the base rate, the evidence-based probability and the weight the evidence had earned; `e=` and `w=` were added after version 2.0, and the column is empty for the oldest predictions) |
 | `latest-run.tsv` | A snapshot of the latest run for the window's Today tab: one tagged line per item (`run`, `story`, `headline` with its link, `prediction`, `step`, `alternative`, `other`). Replaced on every run. |
 | `cassandra.properties` | Optional settings for this folder: `feed.1`, `feed.2` … and `min.articles`, `predicted.stories`, `rank.penalty`, `history.days`, `calibration.min`, `grace.days`. Written by the Settings tab, with a comment on each line; you can also edit it by hand. Missing keys use the defaults. |
 | `cassandra.lock` | An empty file that runs lock while saving, so two runs can't overwrite each other. Safe to ignore. |
@@ -286,7 +316,7 @@ What the latest run found (see the screenshot at the top of the README). It read
 | Part | What it shows | How to read it |
 |---|---|---|
 | Header | The date of the latest run and how many headlines it read | An amber warning appears if that run is 2 or more days old: check your scheduled job. |
-| Story cards | The top 3 stories, each with its share of headlines, tone, momentum and predictions | The bar is her probability. The status on the right turns into "came true" or "didn't happen" once the prediction is graded. Click a card to select it; double-click to open its Story history. |
+| Story cards | The top 3 stories, each with its share of headlines, tone, momentum and predictions, then any challengers (marked "challenger") with their "breaks into the top 5" prediction | The bar is her probability. The status on the right turns into "came true" or "didn't happen" once the prediction is graded. Click a card to select it; double-click to open its Story history. |
 | Coverage chart | The selected story's daily share of headlines since it first appeared, the fitted trend, and the next 7 days | Dots are what happened. The dashed line and shaded band are the projection and its 80% range; the marked points are the 3- and 7-day forecasts. A new or young story has no trend yet. |
 | Latest headlines | Up to 5 recent headlines about the selected story | Blue, underlined headlines open in your browser. |
 | What may follow | The template scenario for the top story, and the other storylines to watch | Not a prediction and not graded: it reads plausibly whatever happens. |
@@ -438,7 +468,6 @@ Publishing writes files and nothing else: it does not post, upload or promote an
    #!/bin/zsh
    # Run Cassandra, publish the website, and push it, recording the CSV's fingerprint in the commit.
    cd /Users/mario/cassandra || exit 1
-   /usr/bin/java Cassandra --selftest > /dev/null || { echo "Self-test failed; not publishing."; exit 1; }
    /usr/bin/java Cassandra --publish=site --site-url=https://rdmachinery.github.io/cassandra-forecasts/
    cd site || exit 1
    git add -A
@@ -459,36 +488,6 @@ Publishing writes files and nothing else: it does not post, upload or promote an
 
 Cassandra predicts news *coverage*. If she ever became widely read, her forecasts could change the coverage they predict: a story called "likely to stay big" might be kept big partly because of the forecast, or dropped because "everyone's covering it". Her score would then measure some of her influence as well as her foresight. So the page reports **accuracy since the first day of publication separately**, and the README's accuracy figures should say which period they cover. For the same reason, Cassandra never acts on the news herself: no posting, sharing or promoting stories, which would turn forecasting into manipulation and make her track record meaningless.
 
-## Self-test
-
-```bash
-java Cassandra --selftest
-```
-
-Runs Cassandra's built-in checks and prints one line per check, ending with `All 17 checks passed`. It works offline, in a temporary folder that is removed afterwards, with the default settings, so it never touches your data and gives the same answer on any machine. The exit status is 0 if every check passes and 1 otherwise, so a script can stop before doing anything with a broken build (the [publish script](#putting-it-online) does exactly that).
-
-| Check | What it guards |
-|---|---|
-| Brier score | The scoring formula, and the 0.25 a coin flip should get |
-| Base-rate forecaster only uses results known at the time | The benchmark can't flatter itself with hindsight |
-| Accuracy verdicts | A well-informed forecaster is judged "beating", a backwards one "worse", 20 results "too early"; the skill score sits inside its interval |
-| Recalibration | No change on too few results; overconfidence pulled down, underconfidence pushed up |
-| Trend fit | Slope and fitted value of an exact line, the spread's floor, no trend from two days |
-| Trend starts on the day a story first appeared | Earlier days don't count as zero coverage |
-| Momentum from daily history | Accelerating, steady, fading, new and unclear in the right cases |
-| Probabilities start from the base rate | The base rate, the shrinkage of evidence groups, the warm-up, and no use of results not yet known |
-| Grading | Came true, didn't happen, not yet due, void after the grace period, share and tone claims |
-| Saving and loading predictions | Exact round trip, the evidence column, and older 11-column files |
-| Settings file | Defaults with no file, exact round trip, out-of-range and garbled values ignored |
-| Run lock | A second run is refused while one is saving, and the lock is released after |
-| Reading an RSS feed | HTML and "Continue reading" removed, links and dates read, blank items skipped, missing dates handled, a feed with a DOCTYPE (an XXE attack) refused |
-| Duplicates, wrapping, CSV quoting | Small text utilities behave |
-| Headline archive round trip | Archived headlines, links and run time come back exactly |
-| End to end | Six demo days produce every file, grade predictions, record evidence, and replay reproduces them byte for byte |
-| Publishing | Every file written, the fingerprint matches, the RSS parses, demo data labelled, every prediction in the CSV |
-
-It does not test the desktop window (that needs a screen) or fetch live feeds. To check that the checks themselves work, ten realistic bugs were each introduced on purpose; every one made the self-test fail with the right check named.
-
 ## Known limitations
 
 - **It cannot foresee events.** The predictions are about news coverage (what will be in the headlines, how big it will be, what tone it will have), not about the underlying events. The narrative is template-based and will sound plausible whatever the facts. Do not use any of it for financial, political or safety decisions.
@@ -497,6 +496,8 @@ It does not test the desktop window (that needs a screen) or fetch live feeds. T
 - **The interval is approximate.** Resampling by day allows for predictions on the same day being linked, but not for links across days (the same story is predicted about on several days running), so the true uncertainty is somewhat wider.
 - **Small groups learn slowly.** Rank and momentum are learned from the record, but a group with few results stays near the type's base rate, so real differences take a few weeks to show; and on short records the groups can disagree in odd ways (a 7-day forecast higher than the 3-day one).
 - **A cold start takes time.** No trend appears until three different days have been recorded, the first grades arrive three days after the first run, and a verdict needs a few weeks.
+- **Records from version 2.0 hold two tone types.** Tone predictions made by 2.0 (`TONE_PERSIST`) keep their old rule, so a faded story voids them; newer ones (`TONE_HOLDS`) count it as a miss. The report lists the two types separately, and the new type builds its base rate from scratch.
+- **Challengers are picked by their words.** A challenger must be named in two headlines and not be a lone tone word, but a generic word ("residents", "firms") can still occasionally slip through as a "story".
 - **Story identity can drift.** A story is tracked by its top-ranked term; if the leading word changes from day to day, history for that story may be split, and it may be treated as new.
 - **Sentiment is crude.** A small word list cannot handle negation or sarcasm.
 - **Coverage is not reality.** Feeds are editorial selections, and the result reflects what these outlets chose to publish.
@@ -512,7 +513,7 @@ Planned features, roughly in priority order. None of these are implemented yet.
 ### Better learning
 
 - **Test the evidence on real headlines.** After a few weeks of live runs, replay the archive to see which evidence (rank, momentum, trend, tone strength) actually carries information, and drop or add evidence accordingly.
-- **New prediction types.** For example `DROP_OUT` (the story leaves the top 10 within 7 days) and `OUTLETS_UP` (more outlets covering it in 3 days).
+- **More prediction types.** For example `OUTLETS_UP` (more outlets covering a story in 3 days), or a 7-day horizon for `LEAD` and `RISE`.
 - **HTML accuracy report.** The window's charts as a self-contained HTML page, for sharing the track record.
 
 ### Smarter analysis
@@ -530,20 +531,45 @@ Planned features, roughly in priority order. None of these are implemented yet.
 
 ## Contributing
 
-Issues and pull requests are welcome. If you change priors, lexicons or templates, include a short before/after example in the PR description, ideally with `--report` output from the same data before and after. Please run `java Cassandra --selftest` first, and add a check for anything new.
+Issues and pull requests are welcome. If you change priors, lexicons or templates, include a short before/after example in the PR description, ideally with `--report` output from the same data before and after. Please check that a 35-day demo simulation (the window's **Run** tab, or `--demo` with `--asof`) still runs and that its `--report` is no worse than before.
 
 ## Version history
 
+### Version 2.1
+
+Fairer tone claims, evidence that has to earn its place, and two harder kinds of prediction.
+
+#### Tone claims no longer hide their misses
+
+- The old tone claim (`TONE_PERSIST`, "coverage will still be clearly negative") was **voided whenever the story had faded below 3 headlines**, which is exactly when the claim is most likely to have failed. Voided predictions are left out of every score, so the misses vanished: on 41 demo days it "came true" 99% of the time, with 17 voids.
+- It is replaced by **`TONE_HOLDS`**: "the story will still be in the news (3+ headlines) and its coverage still clearly negative (or positive)". A story that has faded is graded as didn't happen. On demo data this claim comes true about 80% of the time, with no voids.
+- Tone predictions already in your record keep their original rule and still show up as their own type, so existing results aren't rewritten. `TONE_HOLDS` also uses momentum as evidence, since a fading story is the one most likely to leave the news.
+
+#### The evidence has to earn its weight
+
+The README promised that she "adjusts only as far as her record shows the evidence matters". In 2.0 she adjusted for her evidence whether or not it had ever helped, and on demo data that made her measurably worse than the base rate. Now:
+
+- Every prediction records the base rate (`b=`), the evidence-based probability (`e=`) and the weight the evidence had earned (`w=`).
+- Once a type has 20 graded results carrying both numbers, the evidence's weight comes from how it has actually scored against the plain base rate: full weight if it has been 10% better, none if it has been 10% worse, 0.5 until then. See [How a run works](#how-a-run-works).
+- The terminal shows where each probability came from, e.g. `-> 74% [base rate 81%, evidence says 69%, trusted 42%]`, and the window's tooltips say the same.
+- On 41 and 70 demo days the skill score went from −0.04 and −0.03 (both measurably worse than the base rate) to −0.00, with narrower intervals; see [What the report looks like](#what-the-report-looks-like).
+- Probabilities from the base rate may now range from 1% to 99%, the same range the base-rate forecaster can reach. The old 3–97% cap made her lose on near-certain claims by design.
+
+#### Two harder kinds of prediction
+
+Most of her claims were "the story will still be there", which are right most of the time and say little about whether she reads the news well.
+
+- **`LEAD`: will the leading story still lead in 3 days?** Evidence: momentum, and whether the leader is well ahead of the runner-up (at least 1.5 times its share) or close.
+- **`RISE`: will a challenger break into the top 5 within 3 days?** Up to 2 challengers a day: the stories ranked 6 to 10 whose share of headlines has grown most against their average over the previous 3 days. A challenger must be named in at least two headlines, and lone tone words such as "warn" are skipped. Evidence: rank and momentum.
+- Challengers appear in a **CHALLENGERS** section of the terminal output, as cards marked "challenger" in the window's Today tab, and with a "challenger" badge on the published site.
+
+#### Smaller changes
+
+- **The reliability table says when a gap could be chance.** A band more than 10 points off is marked "(could be chance)" when the gap is within two standard errors for that many results.
+- **A richer demo.** Five smaller storylines (rail fares that climb in the second week, a steady by-election, a fading drought, a vaccine trial and a bank merger that flares up mid-cycle) give the demo stories ranked 6 to 10, so challengers can be tried offline. Demo figures from earlier versions are not comparable with these.
+- The documentation no longer mentions a `--selftest` command, which had been described but was never part of the program.
+
 ### Version 2.0
-
-#### Self-test (`--selftest`)
-
-`java Cassandra --selftest` runs 17 built-in checks in under a second and prints PASS or FAIL for each. See [Self-test](#self-test).
-
-- **Offline and harmless:** everything runs in a temporary folder that is deleted afterwards, with default settings; your data, settings and feeds are never touched
-- **Exit code 0 if all pass, 1 if any fail,** so scripts can rely on it; `publish.sh` now refuses to publish if a check fails
-- **Proven to catch bugs:** ten deliberate bugs were introduced one at a time, including the old momentum bug and a base-rate forecaster that peeks at future results, and every one was caught by the check you'd expect
-- Feed parsing is now separate from downloading, so it can be tested without the network, and a malformed feed no longer prints a parser error to the log
 
 #### Momentum fixed, and probabilities start from the base rate
 

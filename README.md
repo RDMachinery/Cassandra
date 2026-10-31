@@ -42,10 +42,17 @@ Each time she runs, Cassandra:
    |---|---|
    | It will still be among the top five stories | 3 days, and again after 7 |
    | It will take a bigger share of the headlines than today | 3 days |
-   | Its coverage will still be clearly negative (or positive) | 3 days |
+   | It will still be in the news, with coverage still clearly negative (or positive) | 3 days |
+
+   Plus two harder ones, which are where she has the most chance to show she can read the news:
+
+   | Prediction | Checked after |
+   |---|---|
+   | The leading story will still be the leading story | 3 days |
+   | A *challenger*, one of the fastest-growing stories just outside the top five, will break into it | 3 days |
 
 5. **Grades earlier predictions.** Any prediction that has fallen due is marked as *came true* or *didn't happen*, automatically. Nobody can change the outcome by hand.
-6. **Learns from her record.** For each kind of prediction she starts from how often that kind has come true in the past, and adjusts only as far as her record shows the evidence matters. For example, does a story's rank actually make a difference? If the record says no, she doesn't pretend otherwise.
+6. **Learns from her record.** For each kind of prediction she starts from how often that kind has come true in the past. She also weighs clues such as a story's rank and momentum, but a clue only gets a say once her record shows it has actually helped her. If it hasn't, she sticks with what usually happens and doesn't pretend otherwise.
 7. **Writes a short scenario** of what may follow for the top story. This is a hand-written template, not a prediction, and it's labelled as such.
 
 Her predictions are about **news coverage** (what will be in the headlines), not about events themselves. "The port strike will still be a top story on Saturday" is something she can check; "the strike will end by Saturday" is not.
@@ -61,7 +68,7 @@ What can be said is how she's judged, and that the test is deliberately hard to 
 
 Her score is a single **skill** number: above zero means she beats "what usually happens", zero means she's no better, and below zero means she's worse. It comes with a margin of error, and she won't give a verdict at all until there are enough results to be fair.
 
-**On demo data so far:** she easily beats a coin flip, and is just short of "what usually happens" (skill −0.04). That's the expected result, because the demo headlines are random, so there's nothing to predict beyond the usual patterns. A recent improvement, starting every prediction from "what usually happens", brought her from −0.17 up to −0.04 on the same demo days. Whether she can do better than common sense on real news is exactly what her live record will show.
+**On demo data so far:** she beats a coin flip and is level with "what usually happens" (skill +0.01 over 35 demo days, with a margin of error from −0.01 to +0.02). That's the expected result, because the demo headlines are random, so there's little to predict beyond the usual patterns. In version 2.1 her clues have to earn their say: before that, trusting them regardless made her measurably *worse* than "what usually happens" on two of three demo periods (−0.04 and −0.03), and now she's level on all three. Whether she can do better than common sense on real news is exactly what her live record will show.
 
 ## Getting started
 
@@ -111,7 +118,7 @@ java Cassandra.java --gui
 
 The window shows everything Cassandra knows, in six tabs. It updates by itself a few seconds after each daily run, so you can leave it open.
 
-**Today** (pictured at the top of this page) shows what the latest run found: a card for each of the three leading stories with its predictions, a chart of how much coverage the selected story has had and where it's heading, and its latest headlines, which you can click to read. Click a card to choose a story; double-click it to see the story's whole history.
+**Today** (pictured at the top of this page) shows what the latest run found: a card for each of the three leading stories with its predictions (plus any challengers, marked as such), a chart of how much coverage the selected story has had and where it's heading, and its latest headlines, which you can click to read. Click a card to choose a story; double-click it to see the story's whole history.
 
 **Accuracy** answers "is she any good?" at a glance. A coloured banner gives the verdict: green if she's beating "what usually happens", red if she's worse, amber if it's too close to call, grey if it's too early to say. The chart on the left shows whether things she calls 70% likely really happen about 70% of the time.
 
@@ -203,12 +210,9 @@ Cassandra only creates the files; she never posts or uploads anything herself. T
 | See her accuracy | `java Cassandra --report` |
 | Replay past days into a separate folder | `java Cassandra --replay=cassandra-data` |
 | Run, then write her website | `java Cassandra --publish=site` |
-| Check that Cassandra is working properly | `java Cassandra --selftest` |
 | List every option | `java Cassandra --help` |
 
 Add `--data=FOLDER` to any of these to use a different data folder. If you haven't compiled her with `javac`, type `java Cassandra.java` instead of `java Cassandra`.
-
-**`--selftest`** runs 17 quick checks on Cassandra herself (her scoring, grading, saving and so on) without touching your data, and reports whether each passed. It's worth running after updating her.
 
 ## What she can't do
 
@@ -227,17 +231,17 @@ When she fetches a news feed, Cassandra sends only a standard request for that f
 
 ## Plans
 
-- **Test her methods on real news.** After a few weeks of daily runs, replay the archive to find out which of the clues she uses (a story's rank, momentum, trend and tone) really help her predict.
-- **New kinds of prediction**, such as "this story will drop out of the top ten within a week".
+- **Test her methods on real news.** Her clues now have to earn their say, which shows how much each kind of prediction trusts them. After a few weeks of daily runs, replaying the archive will show which clues really help.
+- **More kinds of prediction**, such as "more outlets will be covering this story in three days".
 - **Better story tracking**, so a story is followed correctly even when the words used to describe it change.
 - **Better tone reading**, so "not good" isn't counted as positive.
 - **Support for Atom feeds** as well as RSS, and friendlier fetching that skips feeds that haven't changed.
 
 ## For developers
 
-Cassandra is a single Java file with no external libraries. The [technical guide](TECHNICAL.md) covers how she works in detail: the scoring maths, every step of a run, the saved file formats, all settings and where to change things in the code, the self-test, replay, publishing on GitHub Pages, and the full version history.
+Cassandra is a single Java file with no external libraries. The [technical guide](TECHNICAL.md) covers how she works in detail: the scoring maths, every step of a run, the saved file formats, all settings and where to change things in the code, replay, publishing on GitHub Pages, and the full version history.
 
-Issues and pull requests are welcome. Please run `java Cassandra --selftest` before submitting changes.
+Issues and pull requests are welcome. Please check that a 35-day demo simulation still runs and that `--report` on it is no worse than before.
 
 ## Licence
 

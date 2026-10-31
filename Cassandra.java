@@ -243,7 +243,8 @@ public class Cassandra {
         List<String> feeds = new ArrayList<>();
 
         for (String a : args) {
-            if (a.equals("--demo")) demo = true;
+            if (a.equals("--selftest")) System.exit(selfTest() == 0 ? 0 : 1);
+            else if (a.equals("--demo")) demo = true;
             else if (a.startsWith("--publish=")) publishArg = a.substring(10);
             else if (a.startsWith("--publish-only=")) { publishArg = a.substring(15); publishOnly = true; }
             else if (a.startsWith("--site-url=")) siteUrl = a.substring(11);
@@ -310,6 +311,8 @@ public class Cassandra {
                                   predictions.csv, predictions.sha256) into SITE
                   --publish-only=SITE   write the website from saved results, without running
                   --site-url=URL  the published site's address, used as the RSS feed's link
+                  --selftest      run the built-in checks (offline, in temporary folders) and exit
+                                  with status 0 if all pass, 1 if any fail
                 """);
     }
 
@@ -341,12 +344,17 @@ public class Cassandra {
                 .GET().build();
         HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
         if (resp.statusCode() != 200) throw new RuntimeException("HTTP " + resp.statusCode());
+        return parseFeed(resp.body(), URI.create(url).getHost().replaceFirst("^(www|feeds)\\.", ""));
+    }
 
+    /** Turn an RSS 2.0 document into articles from the given source. */
+    static List<Article> parseFeed(byte[] xml, String host) throws Exception {
         DocumentBuilderFactory f = DocumentBuilderFactory.newInstance();
         f.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true); // block XXE
-        Document doc = f.newDocumentBuilder().parse(new ByteArrayInputStream(resp.body()));
+        javax.xml.parsers.DocumentBuilder db = f.newDocumentBuilder();
+        db.setErrorHandler(new org.xml.sax.helpers.DefaultHandler());   // report bad feeds by exception, not on stderr
+        Document doc = db.parse(new ByteArrayInputStream(xml));
 
-        String host = URI.create(url).getHost().replaceFirst("^(www|feeds)\\.", "");
         List<Article> out = new ArrayList<>();
         NodeList items = doc.getElementsByTagName("item");
         for (int i = 0; i < items.getLength(); i++) {
@@ -1955,6 +1963,328 @@ public class Cassandra {
                     X.applyAsDouble(i), Y.applyAsDouble(r.compBrier()), r.week().format(WEB_DAY), r.compBrier(), r.compBase(), r.comparable()));
         }
         return s.append("</svg>").toString();
+    }
+
+    // ------------------------------------------------------------------ self-test (--selftest)
+
+    interface Check { void run() throws Exception; }
+
+    static void expect(boolean ok, String what) {
+        if (!ok) throw new AssertionError(what);
+    }
+
+    static void near(double got, double want, String what) {
+        if (Double.isNaN(got) || Math.abs(got - want) > 1e-6)
+            throw new AssertionError(what + ": expected " + want + ", got " + got);
+    }
+
+    /** A prediction for tests: term "t", graded on its due date unless pending. */
+    static Pred testPred(String id, LocalDate made, int days, String kind, String outcome, double p, String features) {
+        LocalDate due = made.plusDays(days);
+        return new Pred(id, made, due, "t", "t", kind, "-", p, p, outcome,
+                outcome.equals("PENDING") ? "-" : due.toString(), features);
+    }
+
+    static void deleteQuietly(Path p) {
+        try (var s = Files.walk(p)) {
+            s.sorted(Comparator.reverseOrder()).forEach(f -> f.toFile().delete());
+        } catch (IOException ignored) { /* temporary files */ }
+    }
+
+    /**
+     * Run Cassandra's built-in checks. Everything happens offline in temporary folders, so real data is never
+     * touched. Returns the number of failed checks.
+     */
+    static int selfTest() {
+        java.io.PrintStream out = System.out;
+        LocalDate today0 = TODAY;
+        Instant now0 = NOW;
+        Map<String, Check> checks = new LinkedHashMap<>();
+        Path tmp;
+        try {
+            tmp = Files.createTempDirectory("cassandra-selftest-");
+        } catch (IOException e) {
+            out.println("Could not create a temporary folder: " + e.getMessage());
+            return 1;
+        }
+        LocalDate d0 = LocalDate.of(2026, 10, 1);
+
+        checks.put("Brier score", () -> {
+            List<Pred> ps = List.of(testPred("a", d0, 3, "TOP5", "TRUE", 0.8, ""),
+                    testPred("b", d0, 3, "TOP5", "FALSE", 0.3, ""));
+            near(brier(ps, Pred::p), (0.04 + 0.09) / 2, "mean of (0.8-1)^2 and (0.3-0)^2");
+            near(brier(ps, p -> 0.5), 0.25, "a coin flip always scores 0.25");
+        });
+
+        checks.put("Base-rate forecaster only uses results known at the time", () -> {
+            List<Pred> ps = new ArrayList<>();
+            for (int i = 0; i < 12; i++)
+                ps.add(testPred("p" + i, d0.plusDays(i), 3, "TOP5", i % 3 == 0 ? "FALSE" : "TRUE", 0.7, ""));
+            Map<String, Double> base = baseRates(ps);
+            expect(!base.containsKey("p5"), "made on day 5, only 3 earlier results are known: no base rate yet");
+            // made on day 10: known are those graded by day 10, i.e. made on days 0-7 (8 results, 5 true)
+            long hits = ps.subList(0, 8).stream().filter(p -> p.outcome().equals("TRUE")).count();
+            near(base.get("p10"), (hits + 0.5) / 9.0, "base rate for the prediction made on day 10");
+        });
+
+        checks.put("Accuracy verdicts: beating, worse, too early", () -> {
+            Random rnd = new Random(7);
+            List<Pred> good = new ArrayList<>(), bad = new ArrayList<>();
+            for (int i = 0; i < 80; i++) {
+                String o = rnd.nextDouble() < 0.5 ? "TRUE" : "FALSE";
+                good.add(testPred("g" + i, d0.plusDays(i), 3, "TOP5", o, o.equals("TRUE") ? 0.9 : 0.1, ""));
+                bad.add(testPred("b" + i, d0.plusDays(i), 3, "TOP5", o, o.equals("TRUE") ? 0.1 : 0.9, ""));
+            }
+            expect(computeAccuracy(good, tmp).verdict() == Verdict.BEATING, "a well-informed forecaster beats the base rate");
+            expect(computeAccuracy(bad, tmp).verdict() == Verdict.WORSE, "a backwards forecaster is worse");
+            expect(computeAccuracy(good.subList(0, 20), tmp).verdict() == Verdict.TOO_EARLY, "20 results: too early");
+            Accuracy a = computeAccuracy(good, tmp);
+            expect(a.ci()[0] <= a.skill() && a.skill() <= a.ci()[1], "the skill score lies inside its interval");
+        });
+
+        checks.put("Recalibration", () -> {
+            near(calibrate(0.8, new Stat(MIN_FOR_CALIBRATION - 1, 0, 0.8, 0)), 0.8, "too few results: unchanged");
+            expect(calibrate(0.8, new Stat(40, 20, 0.8, 0)) < 0.8, "overconfident record pulls forecasts down");
+            expect(calibrate(0.6, new Stat(40, 38, 0.6, 0)) > 0.6, "underconfident record pushes forecasts up");
+        });
+
+        checks.put("Trend fit", () -> {
+            List<double[]> pts = new ArrayList<>();
+            for (int x = -4; x <= 0; x++) pts.add(new double[]{x, 0.30 + 0.02 * x});
+            Forecast fc = fit(pts);
+            near(fc.slope(), 0.02, "slope of an exact line");
+            near(fc.fittedToday(), 0.30, "fitted value today");
+            near(fc.sd(), 0.02, "the spread never goes below its 2-point floor");
+            expect(fit(pts.subList(3, 5)) == null, "two days of data: no trend");
+        });
+
+        checks.put("Trend starts on the day a story first appeared", () -> {
+            TODAY = d0.plusDays(10);
+            List<HistRow> h = new ArrayList<>();
+            for (int i = 5; i >= 1; i--) h.add(new HistRow(TODAY.minusDays(i), "other", 1, 5, 10, 0));
+            h.add(new HistRow(TODAY.minusDays(2), "t", 2, 3, 10, 0));
+            h.add(new HistRow(TODAY.minusDays(1), "t", 2, 4, 10, 0));
+            List<double[]> pts = trendPoints(h, "t", 0.5);
+            expect(pts.size() == 3, "two earlier days plus today, not " + pts.size());
+            near(pts.get(0)[0], -2, "first point is the day it appeared");
+            expect(firstSeen(h, "t").equals(TODAY.minusDays(2)), "first seen two days ago");
+        });
+
+        checks.put("Momentum from daily history", () -> {
+            TODAY = d0.plusDays(10);
+            List<HistRow> h = new ArrayList<>();
+            for (int i = 1; i <= 3; i++) h.add(new HistRow(TODAY.minusDays(i), "t", 1, 2, 10, 0));   // 20% share
+            expect(momentumOf(h, "t", 0.30).label().equals("accelerating"), "20% -> 30% is accelerating");
+            expect(momentumOf(h, "t", 0.21).label().equals("steady"), "20% -> 21% is steady");
+            expect(momentumOf(h, "t", 0.10).label().equals("fading"), "20% -> 10% is fading");
+            expect(momentumOf(h, "other", 0.30).label().equals("new"), "absent before: new");
+            expect(momentumOf(List.of(), "t", 0.30).label().equals("unclear"), "no earlier runs: unclear");
+            near(momentumOf(h, "t", 0.30).before(), 0.20, "average share before");
+        });
+
+        checks.put("Probabilities start from the base rate", () -> {
+            TODAY = d0.plusDays(30);
+            List<Pred> known = new ArrayList<>();
+            for (int i = 0; i < 6; i++) known.add(testPred("r1-" + i, d0.plusDays(i), 3, "TOP5", "TRUE", 0.7, "r=1;m=steady"));
+            for (int i = 0; i < 4; i++) known.add(testPred("r2-" + i, d0.plusDays(i), 3, "TOP5", "FALSE", 0.7, "r=2;m=steady"));
+            double base = (6 + 0.5) / 11.0;
+            near(fromBaseRate(known, "TOP5@3")[0], base, "no evidence: the base rate");
+            near(fromBaseRate(known, "TOP5@3", "r=1")[0], (6 + BASE_PRIOR_WEIGHT * base) / (6 + BASE_PRIOR_WEIGHT),
+                    "rank 1 pulled towards its own record");
+            near(fromBaseRate(known, "TOP5@3", "r=3")[0], base, "no rank-3 results: stays at the base rate");
+            expect(fromBaseRate(known.subList(0, 4), "TOP5@3") == null, "4 results: too few, use the first guess");
+            TODAY = d0.plusDays(4);   // only 4 results are graded by now; later ones must not count
+            expect(fromBaseRate(known, "TOP5@3") == null, "results not yet known are ignored");
+        });
+
+        checks.put("Grading predictions when they fall due", () -> {
+            TODAY = d0.plusDays(10);
+            List<Doc> docs = new ArrayList<>();
+            for (int i = 0; i < 4; i++)
+                docs.add(analyse(new Article("x", "Port strike crisis deepens " + i, "Attack and fear as talks collapse",
+                        NOW, "")));
+            Map<String, List<Doc>> index = new HashMap<>();
+            index.put("port", docs);
+            Snapshot snap = new Snapshot(index, List.of("port"), 8);
+            Pred top = new Pred("1", TODAY.minusDays(3), TODAY, "port", "port", "TOP5", "-", .7, .7, "PENDING", "-", "");
+            Pred gone = new Pred("2", TODAY.minusDays(3), TODAY, "gone", "gone", "TOP5", "-", .7, .7, "PENDING", "-", "");
+            Pred future = new Pred("3", TODAY, TODAY.plusDays(3), "port", "port", "TOP5", "-", .7, .7, "PENDING", "-", "");
+            Pred late = new Pred("4", TODAY.minusDays(9), TODAY.minusDays(GRACE_DAYS + 1), "port", "port", "TOP5", "-",
+                    .7, .7, "PENDING", "-", "");
+            Pred up = new Pred("5", TODAY.minusDays(3), TODAY, "port", "port", "SHARE_UP", "0.1000", .5, .5, "PENDING", "-", "");
+            Pred tone = new Pred("6", TODAY.minusDays(3), TODAY, "port", "port", "TONE_PERSIST", "NEG", .7, .7, "PENDING", "-", "");
+            expect(resolve(top, snap).outcome().equals("TRUE"), "still in the top 5: came true");
+            expect(resolve(gone, snap).outcome().equals("FALSE"), "out of the top 5: didn't happen");
+            expect(resolve(future, snap) == future, "not yet due: unchanged");
+            expect(resolve(late, snap).outcome().equals("VOID"), "past the grace period: void");
+            expect(resolve(up, snap).outcome().equals("TRUE"), "share 50% is above 10%");
+            expect(resolve(tone, snap).outcome().equals("TRUE"), "coverage still negative");
+        });
+
+        checks.put("Saving and loading predictions, old and new formats", () -> {
+            Path d = Files.createDirectories(tmp.resolve("persist"));
+            List<Pred> ps = new ArrayList<>(List.of(testPred("x1", d0, 3, "TOP5", "TRUE", 0.75, "r=1;m=new;b=0.8000"),
+                    testPred("x2", d0, 7, "TOP5", "PENDING", 0.6, "")));
+            TODAY = d0;
+            saveState(d, new ArrayList<>(), ps, List.of(), null, "t");
+            List<Pred> back = loadPreds(d);
+            expect(back.equals(ps), "predictions read back exactly as saved");
+            expect("0.8000".equals(back.get(0).feature("b")), "evidence column kept");
+            Files.write(d.resolve("predictions.tsv"), List.of(String.join("\t", "old", "2026-10-01", "2026-10-04", "t", "t",
+                    "TOP5", "-", "0.7000", "0.7000", "TRUE", "2026-10-04")), StandardCharsets.UTF_8);
+            List<Pred> old = loadPreds(d);
+            expect(old.size() == 1 && old.get(0).features().isEmpty(), "an 11-column line from an older file loads");
+        });
+
+        checks.put("Settings file", () -> {
+            Path d = Files.createDirectories(tmp.resolve("settings"));
+            expect(loadSettings(d).equals(Settings.defaults()), "no file: the defaults");
+            Settings s = new Settings(List.of("https://example.org/a.xml", "https://example.org/b.xml"), 12, 2, 0.05, 21, 7, 3);
+            saveSettings(d, s);
+            expect(loadSettings(d).equals(s), "settings read back exactly as saved");
+            Files.writeString(d.resolve(CONFIG), "predicted.stories=9\ngrace.days=soon\n");
+            Settings bad = loadSettings(d);
+            expect(bad.predictedStories() == 3 && bad.graceDays() == 2, "out-of-range and garbled values fall back");
+        });
+
+        checks.put("Run lock stops a second run saving at the same time", () -> {
+            Path d = tmp.resolve("lock");
+            boolean blocked = withLock(d, () -> {
+                try {
+                    withLock(d, () -> null);
+                    return false;
+                } catch (BusyException e) {
+                    return true;
+                }
+            });
+            expect(blocked, "a second run is refused while the first holds the lock");
+            expect(withLock(d, () -> "free").equals("free"), "the lock is released afterwards");
+        });
+
+        checks.put("Reading an RSS feed", () -> {
+            String rss = "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>"
+                    + "<item><title>&lt;b&gt;Bridge&lt;/b&gt; closure causes delays</title>"
+                    + "<description><![CDATA[<p>Traffic chaos.</p> Continue reading...]]></description>"
+                    + "<link> https://example.org/1 </link><pubDate>Sun, 25 Oct 2026 09:00:00 GMT</pubDate></item>"
+                    + "<item><title>No date here</title><description>x</description></item>"
+                    + "<item><title>  </title><description>blank titles are skipped</description></item>"
+                    + "</channel></rss>";
+            List<Article> a = parseFeed(rss.getBytes(StandardCharsets.UTF_8), "example.org");
+            expect(a.size() == 2, "two usable items, not " + a.size());
+            expect(a.get(0).title().equals("Bridge closure causes delays"), "HTML removed from the title");
+            expect(a.get(0).body().equals("Traffic chaos."), "boilerplate removed: '" + a.get(0).body() + "'");
+            expect(a.get(0).link().equals("https://example.org/1"), "link kept and trimmed");
+            expect(a.get(0).published().equals(Instant.parse("2026-10-25T09:00:00Z")), "publication time read");
+            expect(a.get(1).published().equals(NOW), "missing date: treated as now");
+            String evil = "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY x SYSTEM \"file:///etc/passwd\">]>"
+                    + "<rss><channel><item><title>&x;</title></item></channel></rss>";
+            boolean refused;
+            try { parseFeed(evil.getBytes(StandardCharsets.UTF_8), "x"); refused = false; }
+            catch (Exception e) { refused = true; }
+            expect(refused, "a feed with a DOCTYPE (XXE attack) is refused");
+        });
+
+        checks.put("Duplicate headlines removed; text wrapping; CSV quoting", () -> {
+            List<Article> a = dedupe(List.of(new Article("a", "Same Story", "", NOW, ""),
+                    new Article("b", "same story", "", NOW, ""), new Article("c", "Other", "", NOW, "")));
+            expect(a.size() == 2, "duplicate (ignoring case) removed");
+            String w = wrap("word ".repeat(80).trim(), "  ");
+            for (String line : w.split("\n")) expect(line.length() <= WRAP, "wrapped line too long: " + line.length());
+            expect(csv("a,b").equals("\"a,b\""), "comma quoted");
+            expect(csv("say \"hi\"").equals("\"say \"\"hi\"\"\""), "quotes doubled");
+            expect(csv("plain").equals("plain"), "plain text untouched");
+        });
+
+        checks.put("Headline archive round trip", () -> {
+            Path d = tmp.resolve("archive");
+            TODAY = d0;
+            NOW = Instant.parse("2026-10-01T08:15:00Z");
+            List<Article> a = List.of(new Article("bbc", "Title one", "Body one", Instant.parse("2026-10-01T07:00:00Z"),
+                    "https://example.org/1"), new Article("guardian", "Title two", "", NOW, ""));
+            saveArchive(d, a);
+            ArchiveDay back = loadArchiveDay(archiveFiles(d).get(0));
+            expect(back.date().equals(d0) && back.ran().equals(NOW), "date and run time kept");
+            expect(back.articles().equals(a), "headlines read back exactly");
+        });
+
+        checks.put("End to end: six demo days, grading, and exact replay", () -> {
+            Path a = tmp.resolve("demo"), b = tmp.resolve("demo-replay");
+            for (int i = 0; i < 6; i++) {
+                TODAY = d0.plusDays(i);
+                NOW = TODAY.atTime(12, 0).toInstant(ZoneOffset.UTC);
+                FORMS.clear();
+                forecastRun(dedupe(demoArticles()), a, true);
+            }
+            for (String f : List.of("history.tsv", "predictions.tsv", LATEST))
+                expect(Files.exists(a.resolve(f)), f + " written");
+            expect(archiveFiles(a).size() == 6, "six days archived");
+            List<Pred> ps = loadPreds(a);
+            expect(ps.stream().anyMatch(Pred::graded), "predictions graded by day 6");
+            expect(ps.stream().allMatch(p -> p.feature("m") != null || p.feature("s") != null),
+                    "every prediction records its evidence");
+            expect(loadLatest(a) != null, "latest-run snapshot readable");
+            replay(a, b, Settings.defaults(), line -> { }, () -> false);
+            expect(Files.readString(a.resolve("history.tsv")).equals(Files.readString(b.resolve("history.tsv"))),
+                    "replay reproduces history.tsv exactly");
+            expect(Files.readString(a.resolve("predictions.tsv")).equals(Files.readString(b.resolve("predictions.tsv"))),
+                    "replay reproduces predictions.tsv exactly");
+            expect(holdsTrackRecord(b), "replay folder holds a track record");
+        });
+
+        checks.put("Publishing a website", () -> {
+            Path a = tmp.resolve("demo"), site = tmp.resolve("site");
+            publish(a, site, false, "https://example.org/");
+            for (String f : List.of("index.html", "feed.xml", "predictions.csv", "predictions.sha256", SINCE))
+                expect(Files.exists(site.resolve(f)), f + " written");
+            String recorded = Files.readString(site.resolve("predictions.sha256")).split(" ")[0];
+            expect(recorded.equals(sha256(site.resolve("predictions.csv"))), "fingerprint matches the CSV");
+            DocumentBuilderFactory f = DocumentBuilderFactory.newInstance();
+            f.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            Document rss = f.newDocumentBuilder().parse(site.resolve("feed.xml").toFile());
+            expect(rss.getElementsByTagName("item").getLength() > 0, "RSS feed parses and has items");
+            expect(Files.readString(site.resolve("index.html")).contains("Demo data"),
+                    "demo data labelled even without --demo");
+            List<String> csvLines = Files.readAllLines(site.resolve("predictions.csv"));
+            expect(csvLines.size() == loadPreds(a).size() + 1, "CSV has every prediction plus a header");
+        });
+
+        // ---- run them
+        String bar = "=".repeat(WRAP);
+        out.println(bar);
+        out.println(" CASSANDRA - self-test (offline, in " + tmp + ")");
+        out.println(bar);
+        int failed = 0;
+        java.io.PrintStream quiet = new java.io.PrintStream(java.io.OutputStream.nullOutputStream());
+        long t0 = System.currentTimeMillis();
+        for (var c : checks.entrySet()) {
+            Settings.defaults().apply();   // checks never depend on a local cassandra.properties
+            System.setOut(quiet);
+            String error = null;
+            try {
+                c.getValue().run();
+            } catch (Throwable e) {
+                error = e instanceof AssertionError ? e.getMessage() : e.toString();
+            } finally {
+                System.setOut(out);
+                TODAY = today0;
+                NOW = now0;
+                FORMS.clear();
+            }
+            if (error == null) out.println("  PASS  " + c.getKey());
+            else {
+                failed++;
+                out.println("  FAIL  " + c.getKey());
+                out.println(wrap(error, "          "));
+            }
+        }
+        deleteQuietly(tmp);
+        out.println();
+        out.println(failed == 0
+                ? String.format(Locale.ROOT, "All %d checks passed in %.1f seconds.", checks.size(),
+                (System.currentTimeMillis() - t0) / 1000.0)
+                : failed + " of " + checks.size() + " checks FAILED.");
+        out.println("(The desktop window is not covered: it needs a screen. Live feeds are not fetched.)");
+        return failed;
     }
 
     // ------------------------------------------------------------------ run lock
