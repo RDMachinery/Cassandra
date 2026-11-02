@@ -81,7 +81,7 @@ public class Cassandra {
     // (see Settings and loadSettings). The window's Settings tab edits that file.
     static int MIN_ARTICLES = 8;               // fewer headlines than this and a run stops without saving
     static int HISTORY_DAYS = 14;              // how far back the trend fit looks
-    static int MIN_FOR_CALIBRATION = 5;        // resolved predictions needed before recalibrating
+    static int MIN_FOR_CALIBRATION = 5;        // graded results her first guess is worth (see fromBaseRate)
     static int GRACE_DAYS = 2;                 // a prediction not graded within this window is void
     static int PREDICTED_STORIES = 3;          // how many of the leading stories get predictions
     static double RANK_PENALTY = 0.07;         // TOP5 prior is lowered by this much per rank below #1
@@ -637,7 +637,7 @@ public class Cassandra {
 
         // 5. Issue new predictions for each leading story
         List<Pred> fresh = new ArrayList<>();
-        for (Story s : top) fresh.addAll(makePredictions(s, history, record, preds));
+        for (Story s : top) fresh.addAll(makePredictions(s, history, preds));
         Set<String> known = preds.stream().map(Pred::id).collect(Collectors.toSet());
         List<Pred> toAdd = fresh.stream().filter(p -> !known.contains(p.id())).toList();
         if (log) {
@@ -794,21 +794,36 @@ public class Cassandra {
      * evidence, shrunk towards the previous step as (hits + k * parent) / (n + k), k = BASE_PRIOR_WEIGHT.
      * A group with few results therefore stays close to the base rate, and evidence only moves the
      * probability as far as the record shows it matters. Only results already known today are used.
-     * Returns {probability, base rate}, or null while the type has fewer than BASE_WARMUP graded results.
+     *
+     * guess is her (bias-corrected) first guess for this prediction. It counts as MIN_FOR_CALIBRATION
+     * results of its own, so the starting point moves smoothly from her guess to the record as results arrive:
+     * start = (hits + w * guess) / (n + w). With w = 5, five results count as much as her guess and thirty
+     * outweigh it six to one. (Until version 2.1 she switched abruptly from her guess to the base rate at
+     * the fifth result, trusting a rate measured on five results completely.)
+     *
+     * Returns {probability, base rate, results}, or null while the type has no graded result yet.
      */
-    static double[] fromBaseRate(List<Pred> known, String key, String... evidence) {
+    static double[] fromBaseRate(List<Pred> known, String key, double guess, String... evidence) {
         List<Pred> group = known.stream()
                 .filter(p -> p.graded() && p.key().equals(key) && !resolvedOn(p).isAfter(TODAY)).toList();
-        if (group.size() < BASE_WARMUP) return null;
-        double base = (group.stream().filter(p -> p.outcome().equals("TRUE")).count() + 0.5) / (group.size() + 1.0);
-        double p = base;
+        if (group.isEmpty()) return null;
+        int n0 = group.size();
+        long hits0 = group.stream().filter(p -> p.outcome().equals("TRUE")).count();
+        double base = (hits0 + 0.5) / (n0 + 1.0);
+        double w = MIN_FOR_CALIBRATION;
+        double p = (hits0 + w * guess) / (n0 + w);
         for (String e : evidence) {
             String[] kv = e.split("=", 2);
             group = group.stream().filter(x -> kv[1].equals(x.feature(kv[0]))).toList();
             long hits = group.stream().filter(x -> x.outcome().equals("TRUE")).count();
             p = (hits + BASE_PRIOR_WEIGHT * p) / (group.size() + BASE_PRIOR_WEIGHT);
         }
-        return new double[]{clamp(p, 0.03, 0.97), base};
+        return new double[]{clamp(p, 0.03, 0.97), base, n0};
+    }
+
+    /** How long a story has already held on: consecutive earlier days in the top 5, as an evidence bucket. */
+    static String streakBucket(int streak) {
+        return streak == 0 ? "0" : streak <= 2 ? "1-2" : "3+";
     }
 
     static String trendBucket(Forecast fc) {
@@ -817,7 +832,7 @@ public class Cassandra {
         return z > 0.5 ? "up" : z < -0.5 ? "down" : "flat";
     }
 
-    static List<Pred> makePredictions(Story s, List<HistRow> history, Map<String, Stat> record, List<Pred> known) {
+    static List<Pred> makePredictions(Story s, List<HistRow> history, List<Pred> known) {
         List<Pred> out = new ArrayList<>();
         String term = s.term(), label = s.label(), momentum = s.momentum();
         Tone tone = s.tone();
@@ -835,47 +850,53 @@ public class Cassandra {
         double mom = momentum.equals("accelerating") ? 0.10 : momentum.equals("fading") ? -0.15 : 0;
         // lower-ranked stories are less secure in the top 5, so their prior starts lower
         double top3 = clamp(0.62 - RANK_PENALTY * (s.rank() - 1) + 0.05 * Math.min(streak, 5) + mom, 0.10, 0.92);
-        double top7 = clamp(top3 - 0.15, 0.10, 0.92);
+        // a story that leads the news rarely vanishes within a week: 7 days is only a little less likely than 3
+        // (before 2.1 this was 15 points lower, and TOP5@7 claims came true far more often than she said)
+        double top7 = clamp(top3 - 0.05, 0.10, 0.92);
 
         // the hand-set priors above are her first guesses; once a type has a record, pred() starts from its base rate
-        String r = "r=" + s.rank(), m = "m=" + momentum;
-        out.add(pred(term, label, "TOP5", 3, "-", top3, record, known, r, m));
-        out.add(pred(term, label, "TOP5", 7, "-", top7, record, known, r, m));
+        String r = "r=" + s.rank(), m = "m=" + momentum, k = "k=" + streakBucket(streak);
+        out.add(pred(term, label, "TOP5", 3, "-", top3, known, r, m, k));
+        out.add(pred(term, label, "TOP5", 7, "-", top7, known, r, m, k));
 
-        // will its share of coverage be higher in 3 days than today?
+        // Will its share of coverage be higher in 3 days than today? A story is chosen for being among
+        // today's biggest, so its share today is usually near its peak and more often falls than rises
+        // (regression to the mean). Her first guess therefore leans towards "no" even when the trend is up.
         double up;
-        if (fc != null) up = phi(fc.slope() * 3 / fc.predSd(3));
-        else up = momentum.equals("accelerating") ? 0.55 : momentum.equals("fading") ? 0.30
-                : momentum.equals("new") ? 0.45 : 0.42;
+        if (fc != null) up = 0.12 + 0.5 * phi(fc.slope() * 3 / fc.predSd(3));
+        else up = momentum.equals("accelerating") ? 0.40 : momentum.equals("fading") ? 0.15
+                : momentum.equals("new") ? 0.30 : 0.25;
         out.add(pred(term, label, "SHARE_UP", 3, String.format(Locale.ROOT, "%.4f", shareNow),
-                clamp(up, 0.05, 0.95), record, known, "t=" + trendBucket(fc), m));
+                clamp(up, 0.05, 0.95), known, "t=" + trendBucket(fc), m, r));
 
-        // will the tone persist?
+        // will the tone persist? Tone belongs to the story more than to the day, so it usually does
         if (tone != Tone.MIXED) {
             double a = Math.abs(net);
-            double pt = a >= 1.5 ? 0.72 : a >= 1.0 ? 0.66 : 0.58;
-            out.add(pred(term, label, "TONE_PERSIST", 3, tone == Tone.NEGATIVE ? "NEG" : "POS", pt, record, known,
+            double pt = a >= 1.5 ? 0.82 : a >= 1.0 ? 0.75 : 0.68;
+            out.add(pred(term, label, "TONE_PERSIST", 3, tone == Tone.NEGATIVE ? "NEG" : "POS", pt, known,
                     "s=" + (a >= 1.5 ? "strong" : a >= 1.0 ? "medium" : "mild")));
         }
         return out;
     }
 
     /**
-     * One prediction. Once its type has a track record the probability starts from the type's base rate and is
-     * refined by the evidence (fromBaseRate); until then it is her hand-set first guess, recalibrated.
+     * One prediction. Her hand-set first guess is corrected for the bias her record shows for this type
+     * (calibrate); then, once the type has any graded results, the probability starts from a blend of that
+     * corrected guess and the type's base rate and is refined by the evidence (fromBaseRate).
      */
     static Pred pred(String term, String label, String kind, int days, String param, double firstGuess,
-                     Map<String, Stat> record, List<Pred> known, String... evidence) {
+                     List<Pred> known, String... evidence) {
         LocalDate due = TODAY.plusDays(days);
         String key = kind + "@" + days;
-        double[] b = fromBaseRate(known, key, evidence);
-        String features = String.join(";", evidence);
+        double guess = calibrate(firstGuess, guessRecord(known, key));
+        double[] b = fromBaseRate(known, key, guess, evidence);
+        String features = String.join(";", evidence) + ";g=" + GUESS_RULES;
         double p;
         if (b != null) {
             p = b[0];
-            features += String.format(Locale.ROOT, ";b=%.4f", b[1]);
+            features += String.format(Locale.ROOT, ";b=%.4f;n=%d", b[1], (int) b[2]);
         } else {
-            p = calibrate(firstGuess, record.get(key));
+            p = guess;
         }
         String id = TODAY + "-" + kind + days + "-" + term;
         return new Pred(id, TODAY, due, term, label.replace('\t', ' '), kind, param, firstGuess, p, "PENDING", "-",
@@ -986,9 +1007,27 @@ public class Cassandra {
         return new Stat(ps.size(), hits, raw / ps.size(), brier / ps.size());
     }
 
-    /** Shift a probability in logit space by this prediction type's historical bias. */
+    /**
+     * The edition of her hand-set first-guess rules, recorded with each prediction as g=. Version 2.1 rewrote
+     * the rules, so the bias measured on older guesses says nothing about the new ones; calibrate() only
+     * learns from guesses made under the current rules. Bump this whenever makePredictions' priors change.
+     */
+    static final String GUESS_RULES = "2";
+
+    /** The graded record, known today, of this type's first guesses made under the current rules (or null). */
+    static Stat guessRecord(List<Pred> known, String key) {
+        List<Pred> ps = known.stream().filter(p -> p.graded() && p.key().equals(key)
+                && !resolvedOn(p).isAfter(TODAY) && GUESS_RULES.equals(p.feature("g"))).toList();
+        return ps.isEmpty() ? null : stat(ps);
+    }
+
+    /**
+     * Shift a first guess in logit space by the bias her guesses of this type have shown: if they have averaged
+     * 50% on claims that came true 25% of the time, later guesses move down. The shift is damped by
+     * n / (n + 10), so a short record moves them only a little.
+     */
     static double calibrate(double p, Stat s) {
-        if (s == null || s.n() < MIN_FOR_CALIBRATION) return p;
+        if (s == null || s.n() == 0) return p;
         double rate = clamp((s.hits() + 0.5) / (s.n() + 1.0), 0.02, 0.98);
         double mean = clamp(s.meanRaw(), 0.02, 0.98);
         double w = s.n() / (s.n() + 10.0);
@@ -1032,8 +1071,8 @@ public class Cassandra {
         else
             System.out.println(wrap("Too early to compare her with a base-rate forecaster (" + comp.size() + " of "
                     + MIN_FOR_VERDICT + " comparable predictions). Run with --report for details.", "  "));
-        System.out.println(wrap("Types with " + MIN_FOR_CALIBRATION + "+ graded predictions have their probabilities "
-                + "automatically recalibrated.", "  "));
+        System.out.println(wrap("Each type's probabilities lean on its own record as results arrive: after "
+                + MIN_FOR_CALIBRATION + " graded results the record counts as much as her first guess.", "  "));
     }
 
     // ------------------------------------------------------------------ accuracy report (--report)
@@ -1209,6 +1248,33 @@ public class Cassandra {
         printAccuracy(a);
     }
 
+    /** How a prediction's probability was set, judged from the evidence recorded with it. */
+    static String method(Pred p) {
+        if (p.feature("b") == null) return "Hand-set first guess";
+        return p.feature("g") == null ? "Base rate + evidence (2.0 rules)" : "Record blended with first guess (2.1)";
+    }
+
+    /**
+     * Skill on the comparable predictions, split by how each probability was set. A track record holds
+     * predictions made under every version Cassandra has run, so this shows which method the score reflects.
+     */
+    static void printByMethod(Accuracy a) {
+        if (a.comparable().isEmpty()) return;
+        Map<String, Double> base = baseRates(a.graded());
+        Map<String, List<Pred>> by = new TreeMap<>();
+        for (Pred p : a.comparable()) by.computeIfAbsent(method(p), k -> new ArrayList<>()).add(p);
+        System.out.println("\nBY HOW THE PROBABILITY WAS SET (comparable predictions only)");
+        System.out.println("  method                                          count  Cassandra  base rate  skill");
+        for (var e : by.entrySet()) {
+            List<Pred> ps = e.getValue();
+            double c = brier(ps, Pred::p), b = brier(ps, p -> base.get(p.id()));
+            System.out.println(String.format(Locale.ROOT, "  %-46s %6d  %9.3f  %9.3f  %s", e.getKey(), ps.size(), c, b,
+                    b == 0 ? "n/a" : String.format(Locale.ROOT, "%+.2f", 1 - c / b)));
+        }
+        System.out.println(wrap("Predictions made under older rules stay in the record. If one method is dragging the "
+                + "total down, the newer rows show how she is doing now.", "  "));
+    }
+
     /** Print the accuracy report to the terminal. Reads the result only; computes nothing. */
     static void printAccuracy(Accuracy a) {
         String bar = "=".repeat(WRAP);
@@ -1281,6 +1347,9 @@ public class Cassandra {
         }
         System.out.println(wrap("A type that comes true almost every time is easy to score well on; the skill column "
                 + "shows whether Cassandra does better than simply knowing that.", "  "));
+
+        // ---- by method
+        printByMethod(a);
 
         // ---- reliability
         System.out.println("\nRELIABILITY (when she says X%, does it happen X% of the time?)");
@@ -1441,7 +1510,7 @@ public class Cassandra {
                 "rank.penalty=" + String.format(Locale.ROOT, "%.2f", s.rankPenalty()),
                 "# Days of history the coverage trend is fitted over (3-60)",
                 "history.days=" + s.historyDays(),
-                "# Graded results a prediction type needs before its probabilities are recalibrated (2-50)",
+                "# Graded results after which a type's record counts as much as her first guess (2-50)",
                 "calibration.min=" + s.minForCalibration(),
                 "# Days after its due date that a prediction can still be graded; later, it is voided (0-7)",
                 "grace.days=" + s.graceDays()));
@@ -2043,7 +2112,8 @@ public class Cassandra {
         });
 
         checks.put("Recalibration", () -> {
-            near(calibrate(0.8, new Stat(MIN_FOR_CALIBRATION - 1, 0, 0.8, 0)), 0.8, "too few results: unchanged");
+            near(calibrate(0.8, null), 0.8, "no results: unchanged");
+            expect(Math.abs(calibrate(0.8, new Stat(2, 0, 0.8, 0)) - 0.8) < 0.25, "a short record moves it only a little");
             expect(calibrate(0.8, new Stat(40, 20, 0.8, 0)) < 0.8, "overconfident record pulls forecasts down");
             expect(calibrate(0.6, new Stat(40, 38, 0.6, 0)) > 0.6, "underconfident record pushes forecasts up");
         });
@@ -2087,14 +2157,41 @@ public class Cassandra {
             List<Pred> known = new ArrayList<>();
             for (int i = 0; i < 6; i++) known.add(testPred("r1-" + i, d0.plusDays(i), 3, "TOP5", "TRUE", 0.7, "r=1;m=steady"));
             for (int i = 0; i < 4; i++) known.add(testPred("r2-" + i, d0.plusDays(i), 3, "TOP5", "FALSE", 0.7, "r=2;m=steady"));
-            double base = (6 + 0.5) / 11.0;
-            near(fromBaseRate(known, "TOP5@3")[0], base, "no evidence: the base rate");
-            near(fromBaseRate(known, "TOP5@3", "r=1")[0], (6 + BASE_PRIOR_WEIGHT * base) / (6 + BASE_PRIOR_WEIGHT),
+            double w = MIN_FOR_CALIBRATION, guess = 0.5;
+            double start = (6 + w * guess) / (10 + w);   // her guess counts as w results alongside the record
+            near(fromBaseRate(known, "TOP5@3", guess)[1], (6 + 0.5) / 11.0, "the type's base rate is reported");
+            near(fromBaseRate(known, "TOP5@3", guess)[0], start, "no evidence: base rate blended with her guess");
+            near(fromBaseRate(known, "TOP5@3", guess, "r=1")[0], (6 + BASE_PRIOR_WEIGHT * start) / (6 + BASE_PRIOR_WEIGHT),
                     "rank 1 pulled towards its own record");
-            near(fromBaseRate(known, "TOP5@3", "r=3")[0], base, "no rank-3 results: stays at the base rate");
-            expect(fromBaseRate(known.subList(0, 4), "TOP5@3") == null, "4 results: too few, use the first guess");
+            near(fromBaseRate(known, "TOP5@3", guess, "r=3")[0], start, "no rank-3 results: stays at the start");
+            expect(fromBaseRate(known, "TOP5@3", guess, "r=3")[2] == 10, "results counted for the whole type");
+            double gap10 = fromBaseRate(known, "TOP5@3", 0.9)[0] - fromBaseRate(known, "TOP5@3", 0.1)[0];
+            List<Pred> more = new ArrayList<>(known);
+            for (int i = 0; i < 30; i++) more.add(testPred("m-" + i, d0.plusDays(i % 20), 3, "TOP5", "TRUE", 0.7, ""));
+            double gap40 = fromBaseRate(more, "TOP5@3", 0.9)[0] - fromBaseRate(more, "TOP5@3", 0.1)[0];
+            expect(gap40 < gap10 / 2, "her guess counts for less as the record grows");
+            expect(fromBaseRate(List.of(), "TOP5@3", guess) == null, "no results: use the first guess");
             TODAY = d0.plusDays(4);   // only 4 results are graded by now; later ones must not count
-            expect(fromBaseRate(known, "TOP5@3") == null, "results not yet known are ignored");
+            double[] early = fromBaseRate(known, "TOP5@3", guess);
+            expect(early[2] == 4, "4 results known by day 4, not " + early[2]);
+            near(early[0], (2 + w * guess) / (4 + w), "results not yet known are ignored");
+            TODAY = d0.plusDays(2);
+            expect(fromBaseRate(known, "TOP5@3", guess) == null, "nothing graded yet: use the first guess");
+        });
+
+        checks.put("First guesses learn only from guesses made under the current rules", () -> {
+            TODAY = d0.plusDays(30);
+            List<Pred> known = new ArrayList<>();
+            // old-rules guesses of 50% on claims that came true 1 time in 4: they say nothing about the new rules
+            for (int i = 0; i < 20; i++)
+                known.add(testPred("o-" + i, d0.plusDays(i), 3, "SHARE_UP", i % 4 == 0 ? "TRUE" : "FALSE", 0.5, "t=up"));
+            expect(guessRecord(known, "SHARE_UP@3") == null, "guesses without g=" + GUESS_RULES + " are ignored");
+            for (int i = 0; i < 20; i++)
+                known.add(testPred("n-" + i, d0.plusDays(i), 3, "SHARE_UP", i % 4 == 0 ? "TRUE" : "FALSE", 0.5,
+                        "t=up;g=" + GUESS_RULES));
+            Stat s = guessRecord(known, "SHARE_UP@3");
+            expect(s != null && s.n() == 20, "the 20 current-rules guesses are used");
+            expect(calibrate(0.5, s) < 0.45, "guesses that ran high are pulled down");
         });
 
         checks.put("Grading predictions when they fall due", () -> {
@@ -2528,6 +2625,9 @@ public class Cassandra {
     /** How a prediction's probability was arrived at, for the report. */
     static String startingPoint(Pred p) {
         String b = p.feature("b");
+        if (b != null && p.feature("n") != null)
+            return " [base rate " + pct(Double.parseDouble(b)) + " over " + p.feature("n") + (p.feature("n").equals("1") ? " result" : " results") + " and first guess "
+                    + pct(p.pRaw()) + ", adjusted for the evidence]";
         if (b != null)
             return " [from the base rate of " + pct(Double.parseDouble(b)) + "; first guess " + pct(p.pRaw()) + "]";
         return Math.abs(p.p() - p.pRaw()) > 1e-9 ? " [recalibrated from " + pct(p.pRaw()) + "]" : "";
@@ -3060,7 +3160,11 @@ public class Cassandra {
             ProbBar(Pred p) {
                 this.p = p;
                 setPreferredSize(new Dimension(122, 18));
-                setToolTipText(p.feature("b") != null
+                setToolTipText(p.feature("n") != null
+                        ? "Her first guess (" + pct(p.pRaw()) + ") blended with the base rate for this type ("
+                        + pct(Double.parseDouble(p.feature("b"))) + " over " + p.feature("n")
+                        + (p.feature("n").equals("1") ? " result" : " results") + "), adjusted for the evidence"
+                        : p.feature("b") != null
                         ? "Started from the base rate for this type (" + pct(Double.parseDouble(p.feature("b")))
                         + "), adjusted for the evidence; her first guess was " + pct(p.pRaw())
                         : Math.abs(p.p() - p.pRaw()) > 1e-9
@@ -4527,7 +4631,7 @@ public class Cassandra {
             }
         }
 
-        static final String VERSION = "2.0";
+        static final String VERSION = "2.1";
         static final String REPO = REPO_URL;
 
         void showAbout() {
@@ -4982,8 +5086,8 @@ public class Cassandra {
                         {"Rank penalty", rankPenalty,
                                 "How much lower the starting \"still in the top 5\" probability is for each rank below first."},
                         {"Trend look-back (days)", historyDays, "How many days of history the coverage trend is fitted over."},
-                        {"Results before recalibrating", calibration,
-                                "Graded results a prediction type needs before its probabilities are corrected."},
+                        {"Weight of first guess (results)", calibration,
+                                "How many graded results her first guess is worth. After this many, a type's record counts as much as her guess."},
                         {"Grace period (days)", grace,
                                 "How long after its due date a prediction can still be graded. After that it is voided."}};
                 for (int i = 0; i < rows.length; i++) {
@@ -5065,7 +5169,7 @@ public class Cassandra {
                 if (a.historyDays() != b.historyDays())
                     out.add("Trend look-back: " + a.historyDays() + " → " + b.historyDays() + " days");
                 if (a.minForCalibration() != b.minForCalibration())
-                    out.add("Results before recalibrating: " + a.minForCalibration() + " → " + b.minForCalibration());
+                    out.add("Weight of first guess: " + a.minForCalibration() + " → " + b.minForCalibration());
                 if (a.graceDays() != b.graceDays())
                     out.add("Grace period: " + a.graceDays() + " → " + b.graceDays() + " days");
                 return out;
