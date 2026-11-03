@@ -141,7 +141,7 @@ The window shows everything Cassandra knows, in six tabs. It updates by itself a
 
 **Accuracy** answers "is she any good?" at a glance. A coloured banner gives the verdict: green if she's beating "what usually happens", red if she's worse, amber if it's too close to call, grey if it's too early to say. The chart on the left shows whether things she calls 70% likely really happen about 70% of the time.
 
-![The Accuracy tab: the verdict, headline scores, a chart of how well her probabilities match reality, and her score week by week](accuracy-tab.png)
+![The Accuracy tab: the verdict, headline scores, a chart of how well her probabilities match reality, and her score week by week](accuracy-tab-2.png)
 
 **Predictions** lists every prediction she has ever made, with its outcome. You can sort it, filter it (for example to show only the predictions that didn't happen), search for a story, and save the list as a spreadsheet file. A line above the table shows how well she did on whatever is currently shown.
 
