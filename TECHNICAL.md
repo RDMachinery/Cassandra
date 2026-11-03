@@ -48,67 +48,69 @@ Abridged output after 35 days of `--demo` runs (synthetic headlines, not real ne
 THE SHORT ANSWER
   Cassandra cannot yet be told apart from the base-rate forecaster: any edge she has is
   within the range that luck alone could produce.
-  Skill score -0.02 over 237 comparable predictions (90% interval -0.08 to +0.03). 0 means
+  Skill score -0.02 over 238 comparable predictions (90% interval -0.07 to +0.04). 0 means
   no better than the base rate, 1 would be perfect, below 0 is worse.
 
 BRIER SCORES (lower is better; 0 is perfect)
-  All 294 graded predictions:
-    Cassandra (issued probabilities)    0.159
+  All 295 graded predictions:
+    Cassandra (issued probabilities)    0.158
     Cassandra before recalibration      0.175
     Coin flip (always 50%)              0.250
-  The 237 predictions the base-rate forecaster could also make:
-    Cassandra                           0.157
+  The 238 predictions the base-rate forecaster could also make:
+    Cassandra                           0.156
     Base-rate forecaster                0.153
 
 BY PREDICTION TYPE
   type             graded  came true  avg forecast   Brier   skill vs base rate
-  SHARE_UP@3           80        36%           35%   0.253   -0.06 (on 68)
-  TONE_PERSIST@3       62        95%           94%   0.052   +0.02 (on 52)
+  SHARE_UP@3           80        38%           36%   0.251   -0.04 (on 68)
+  TONE_PERSIST@3       63        95%           94%   0.052   +0.02 (on 53)
   TOP5@3               80        85%           86%   0.141   -0.01 (on 68)
   TOP5@7               72        83%           84%   0.165   +0.02 (on 49)
 
 BY HOW THE PROBABILITY WAS SET (comparable predictions only)
   method                                          count  Cassandra  base rate  skill
-  Record blended with first guess (2.1)             237      0.157      0.153  -0.02
+  Record blended with first guess (2.1)             238      0.156      0.153  -0.02
 
 RELIABILITY (when she says X%, does it happen X% of the time?)
   forecast  graded  avg forecast  came true  verdict
   0-20%         10           15%        40%  forecasts too low by 25 pts
-  20-40%        44           31%        39%  well calibrated
-  40-60%        32           49%        47%  well calibrated
+  20-40%        42           32%        38%  well calibrated
+  40-60%        34           49%        50%  well calibrated
   60-80%        30           69%        80%  forecasts too low by 11 pts
-  80-100%      178           92%        88%  well calibrated
+  80-100%      179           92%        88%  well calibrated
 
 BRIER SCORE BY WEEK (week starting, by date graded)
   week of      graded  Cassandra  before recal  Cassandra vs base rate
   2026-09-28       5      0.121         0.121  n/a
   2026-10-05      61      0.151         0.144  0.140 vs 0.136 (on 23)
   2026-10-12      69      0.187         0.191  0.182 vs 0.157 (on 55)
-  2026-10-19      70      0.143         0.169  0.143 vs 0.133 (on 70)
-  2026-10-26      61      0.170         0.204  0.170 vs 0.191 (on 61)
-  2026-11-02      28      0.126         0.163  0.126 vs 0.125 (on 28)
+  2026-10-19      71      0.142         0.168  0.142 vs 0.133 (on 71)
+  2026-10-26      61      0.169         0.204  0.169 vs 0.192 (on 61)
+  2026-11-02      28      0.124         0.163  0.124 vs 0.124 (on 28)
 ```
 
 How to read this demo result:
 
-- **She can't be told apart from the base rate** (skill −0.02, interval −0.08 to +0.03). That is the right answer for the demo: its headlines are random draws following fixed storylines, so there is little to read beyond how often each kind of claim usually comes true. The report is not rigged in her favour.
-- **Version 2.0 was measurably worse on the same 35 days** (skill −0.04, interval −0.08 to −0.01; Brier 0.164 against 0.159 now). Her first guesses alone improved from 0.207 to 0.175, and `SHARE_UP@3` from −0.10 to −0.06.
-- **Most claims are near-certain on the demo,** so a coin flip is easy to beat (0.159 against 0.250), and the 80–100% band holds most of her forecasts.
+- **She can't be told apart from the base rate** (skill −0.02, interval −0.07 to +0.04). That is the right answer for the demo: its headlines are random draws following fixed storylines, so there is little to read beyond how often each kind of claim usually comes true. The report is not rigged in her favour.
+- **Version 2.0 was measurably worse on the same 35 days** (skill −0.04, interval −0.08 to −0.01; Brier 0.164 against 0.158 now). Her first guesses alone improved from 0.207 to 0.175, and `SHARE_UP@3` from −0.10 to −0.04. The demo's headlines are clean, so 2.2's story-detection changes make little difference here; on real headlines they matter (see [Version 2.2](#version-22)).
+- **Most claims are near-certain on the demo,** so a coin flip is easy to beat (0.158 against 0.250), and the 80–100% band holds most of her forecasts.
 - **Some numbers rest on few results.** The 0–20% band's 25-point gap is from 10 predictions; treat it as noise until there are many more.
-- **Learning from her record helps:** her hand-set first guesses would have scored 0.175; the probabilities she actually issued scored 0.159.
+- **Learning from her record helps:** her hand-set first guesses would have scored 0.175; the probabilities she actually issued scored 0.158.
 
 #### On a simulated news world
 
-The demo has only a handful of fixed storylines, so 2.1 was also tested on three simulated 90-day news worlds: stories arriving at random, rising for a day or two, then fading at very different speeds, with tone that belongs to the story and drifts slowly. Each world's headlines were replayed through 2.0 and 2.1:
+The demo has only a handful of fixed storylines, so the forecasting changes were also tested on three simulated 90-day news worlds: stories arriving at random, rising for a day or two, then fading at very different speeds, with tone that belongs to the story and drifts slowly. Each world's headlines were replayed through each version:
 
 | Overall Brier score | World 1 | World 2 | World 3 |
 |---|---|---|---|
 | First 20 days, 2.0 | 0.201 | 0.206 | 0.234 |
 | First 20 days, 2.1 | 0.203 | 0.192 | 0.225 |
+| First 20 days, 2.2 | 0.187 | 0.199 | 0.212 |
 | 90 days, 2.0 | 0.177 | 0.184 | 0.194 |
 | 90 days, 2.1 | 0.178 | 0.182 | 0.194 |
+| 90 days, 2.2 | 0.170 | 0.179 | 0.177 |
 
-The gain is in the first weeks, while her first guesses still carry weight; once the record is long, both versions are about level, as they should be. A simulated world is only a rough stand-in for real headlines. The real test is replaying your own archive (see [Replay](#replay)).
+2.1's gain is in the first weeks, while her first guesses still carry weight. 2.2's comes from story detection: in these worlds, tone words such as "attack" appear across many stories, and 2.0 and 2.1 sometimes treated them as stories of their own. After 90 days 2.2 beats the base rate in all three worlds (skill +0.12, +0.09 and +0.13). A simulated world is only a rough stand-in for real headlines. The real test is replaying a real archive (see [Replay](#replay) and [Version 2.2](#version-22)).
 
 ### Producing a real track record
 
@@ -125,7 +127,7 @@ java Cassandra --report
 ## How a run works
 
 1. **Gather.** Feeds are downloaded and parsed with the JDK XML parser (DOCTYPE disabled to block XXE). HTML and feed boilerplate ("Continue reading…") are stripped and duplicate headlines removed.
-2. **Rank stories.** Words are tokenised, stopwords removed and plurals stemmed. Each term appearing in at least three articles scores `articles + 1.5 × (outlets − 1) + headline hits`. Terms whose articles overlap by more than 60% are merged into one story.
+2. **Rank stories.** Newsletter and app promotions are removed (`PROMOS`), "n't" is read as "not", and words are tokenised: stopwords removed (`STOP`, plus `STOP2` for story detection only), any word containing a digit dropped (so "$6.3bn" gives nothing), and plurals stemmed. Each term appearing in at least three articles scores `articles + 1.5 × (outlets − 1) + headline hits`, except words that can't name a story on their own: generic words (`GENERIC`: "government", "state", "time" …) and tone words (`NEG`, `POS`). These still count towards labels, tone and related terms. Terms whose articles overlap by more than 60% are merged into one story.
 3. **Measure.** For each of the top 3 stories: tone is the average of (positive − negative lexicon words) per article, and momentum compares today's share of headlines with the story's average over the previous 3 days of runs (accelerating or fading needs a change of at least 3 points and 30%; a story absent from those runs is new). For the dominant story, the domain is the keyword lexicon with the most hits.
 4. **Trend.** Each run saves the top 10 stories and their share of coverage. For each leading story, a least-squares line is fitted through its share from the first day it appeared in the top 10 (within the last 14 days) up to today, giving a projected share with a prediction interval. Days before it appeared are ignored; a day it drops out of the top 10 after appearing counts as a negligible share. At least 3 days of data are needed.
 5. **Predict.** Up to four predictions are logged about each of the top 3 stories:
@@ -143,7 +145,7 @@ java Cassandra --report
    - **Blended with the record, then refined by the evidence.** Once the type has any graded results, she starts from `(hits + w × guess) / (results + w)`, where `w` is the `calibration.min` setting (default 5): her guess counts as 5 results, so after 5 results the record weighs as much as the guess, and after 30 it outweighs it six to one. She then refines that through each piece of evidence in turn: the rate among earlier predictions that shared it, blended with the previous step as `(hits + 10 × previous) / (results + 10)`. A group with few results therefore stays close to the step before, and evidence only moves the probability as far as the record shows it matters. Only results already known on the day are used.
 
    Probabilities are kept between 3% and 97%. The output shows where each came from, e.g. `-> 71% [base rate 85% over 83 results and first guess 82%, adjusted for the evidence]`.
-6. **Grade.** On the first run on or after a prediction's due date (within a 2-day grace period), it is marked true or false. Predictions that cannot be graded (no run happened within the grace period, or a `TONE_PERSIST` claim whose story had fewer than 3 headlines, so its tone couldn't be measured) are voided and excluded from all scores.
+6. **Grade.** On the first run on or after a prediction's due date (within a 2-day grace period), it is marked true or false, using the story-detection rules it was made under: predictions without `d=2` in their evidence are graded with the 2.1 rules, so changing how stories are found never rescores claims already made. Predictions that cannot be graded (no run happened within the grace period, or a `TONE_PERSIST` claim whose story had fewer than 3 headlines, so its tone couldn't be measured) are voided and excluded from all scores.
 7. **Keep the first guess.** Her first guess is stored alongside the probability she issued, so the report can show what learning from her record has gained ("before recalibration").
 8. **Score.** Each run's track record gives Brier scores per type and the skill score against the base-rate forecaster. `--report` adds the interval, verdict, reliability table and weekly scores described in [How she is scored](#how-she-is-scored).
 9. **Narrate.** Hand-written causal templates for the dominant story's domain and tone are filled in for days, weeks and months, with the opposite tone offered as an alternative branch.
@@ -249,7 +251,7 @@ Plain-text files in the data directory (default `./cassandra-data`):
 | File | Contents |
 |---|---|
 | `history.tsv` | date, term, rank, article count, total articles, net sentiment |
-| `predictions.tsv` | id, made, due, term, label, kind, param, first guess, issued probability, outcome, resolved on, evidence (e.g. `r=2;m=steady;k=3+;g=2;b=0.8500;n=32`: rank, momentum, days already in the top 5, the edition of the first-guess rules, the type's base rate and the number of results it rested on; `k=`, `g=` and `n=` were added in 2.1, and the column is empty for predictions made before 26 October 2026) |
+| `predictions.tsv` | id, made, due, term, label, kind, param, first guess, issued probability, outcome, resolved on, evidence (e.g. `r=2;m=steady;k=3+;g=2;d=2;b=0.8500;n=32`: rank, momentum, days already in the top 5, the edition of the first-guess rules, the edition of the story-detection rules, the type's base rate and the number of results it rested on; `k=`, `g=` and `n=` were added in 2.1 and `d=` in 2.2, and the column is empty for predictions made before 26 October 2026) |
 | `latest-run.tsv` | A snapshot of the latest run for the window's Today tab: one tagged line per item (`run`, `story`, `headline` with its link, `prediction`, `step`, `alternative`, `other`). Replaced on every run. |
 | `cassandra.properties` | Optional settings for this folder: `feed.1`, `feed.2` … and `min.articles`, `predicted.stories`, `rank.penalty`, `history.days`, `calibration.min`, `grace.days`. Written by the Settings tab, with a comment on each line; you can also edit it by hand. Missing keys use the defaults. |
 | `cassandra.lock` | An empty file that runs lock while saving, so two runs can't overwrite each other. Safe to ignore. |
@@ -287,6 +289,7 @@ Everything else lives in `Cassandra.java`:
 | Comparable predictions before a type's skill is coloured in the window | `Gui.MIN_TYPE_SKILL` |
 | The desktop window, its tabs and charts | the `Gui` class at the end of the file |
 | Stopwords, sentiment and domain vocabularies | `STOP`, `NEG`, `POS`, `LEX` |
+| Words left out of story detection, words that can't be a story on their own, and newsletter promotions to strip (bump `STORY_RULES` whenever you change these or `tokenize`) | `STOP2`, `GENERIC`, `PROMOS`, `STORY_RULES` |
 | First-guess priors and new prediction types (bump `GUESS_RULES` whenever you change the priors) | `makePredictions`, `resolve`, `statement`, `GUESS_RULES` |
 | Narrative templates | `chain(Domain)` |
 | Demo headlines and storyline | `DEMO_PORT`, `DEMO_CHIP`, `DEMO_STORM`, `DEMO_FILLER`, `demoArticles` |
@@ -488,7 +491,8 @@ Cassandra predicts news *coverage*. If she ever became widely read, her forecast
 - **A cold start takes time.** No trend appears until three different days have been recorded, the first grades arrive three days after the first run, and a verdict needs a few weeks.
 - **Tone predictions hide some misses.** A `TONE_PERSIST` claim is voided when its story has fallen below 3 headlines, because its tone can't be measured, but that is exactly when the claim is most likely to have failed. Voided predictions are left out of every score, so the type looks better than it is. Fixing this is on the [roadmap](#roadmap).
 - **Records span several methods.** Predictions keep the method they were made with, so a record that started under 2.0 mixes hand-set guesses, the 2.0 base-rate method and the 2.1 blend. The report's "by how the probability was set" table separates them.
-- **Story identity can drift.** A story is tracked by its top-ranked term; if the leading word changes from day to day, history for that story may be split, and it may be treated as new.
+- **Story identity can drift.** A story is tracked by its top-ranked term; if the leading word changes from day to day, history for that story may be split, and it may be treated as new. Two stories that share their leading word ("midterm election" and "Israel election") are treated as one.
+- **Word lists need upkeep.** `GENERIC` and `STOP2` were built from the first weeks of live headlines. New feeds bring new filler words and promotions; check the Story history tab now and then for "stories" that aren't. Plurals are stemmed crudely, so "James" is tracked as "jame".
 - **Sentiment is crude.** A small word list cannot handle negation or sarcasm.
 - **Coverage is not reality.** Feeds are editorial selections, and the result reflects what these outlets chose to publish.
 - **Changing settings mid-record mixes set-ups.** Past predictions keep the settings they were made under, so the track record after a change blends two configurations. Test a change on the archive first.
@@ -511,7 +515,9 @@ Planned features, roughly in priority order. None of these are implemented yet.
 
 ### Smarter analysis
 
-- **Stable story identity.** Match today's stories to yesterday's by overlap of their top terms, not by a single leading word, and give each story a persistent ID in `history.tsv`.
+- **Stable story identity.** Match today's stories to yesterday's by overlap of their top terms, not by a single leading word, and give each story a persistent ID in `history.tsv`. (Simply keying stories by their two-word label was considered for 2.2 and rejected: labels change from day to day, "donald trump" one day and "trump administration" the next, so grading would have marked lasting stories as gone.)
+- **Find generic words automatically,** for example words that appear in many unrelated stories over the history, instead of keeping `GENERIC` by hand.
+- **Better `SHARE_UP` evidence.** On real headlines it is her weakest type: in the 2.2 replay its claims came true 46% of the time against an average forecast of 50%, yet it scored 0.380, worse than a coin flip, because her forecasts don't separate the stories that grow from the ones that don't.
 - **Negation-aware sentiment.** Flip the polarity of a lexicon word preceded within two words by "not", "no", "never", "without" and similar.
 - **Bigram story labels** used as the tracked key, so "port strike" and "general strike" are not the same story.
 
@@ -527,6 +533,46 @@ Planned features, roughly in priority order. None of these are implemented yet.
 Issues and pull requests are welcome. If you change priors, lexicons or templates, include a short before/after example in the PR description, ideally with `--report` output from the same data before and after. Please check that `java Cassandra --selftest` passes, that a 35-day demo simulation (the window's **Run** tab, or `--demo` with `--asof`) still runs, and that its `--report` is no worse than before. After changing how probabilities are made, `--replay` over a real archive is the best test.
 
 ## Version history
+
+### Version 2.2
+
+Stories that are stories. Her first two weeks on real headlines showed that a third of her graded predictions (37 of 106) were about things that weren't stories: newsletter promotions, amounts and everyday words.
+
+#### What was wrong
+
+- **"Sign up" was her most frequent story.** Guardian summaries carry promotions ("Don't get Pushing Buttons delivered to your inbox? Sign up here", "Get our breaking news email, free app or daily news podcast"), dozens a day. "up" was in her top 10 on 13 of the 16 days she had run.
+- **Amounts became words.** "$6.3bn" was split into "bn", which became a story.
+- **Everyday words led stories.** "government" was in the top 10 on 10 days and stood for six unrelated stories ("form government", "government spokesperson", "federal government" …). "Will it still be in the top 5?" was really asking whether a word would keep turning up. "state", "time", "help", "leader", "world" and "street" did the same.
+- **"won't" counted as "won"**, a positive word, in tone.
+
+#### What changed
+
+- **Promotions are stripped** (`PROMOS`) when feeds are read *and* when headlines are analysed, so archives saved by older versions replay cleanly.
+- **Words containing digits are dropped**, and "n't" is read as "not".
+- **A second stopword list** (`STOP2`) for story detection only: "up", "them", contraction stubs, days of the week, months, and words such as "since", "ago" and "including".
+- **Generic words and tone words can't lead a story** (`GENERIC`, `NEG`, `POS`). They still count in labels, tone and related terms, so "port strike" is still labelled "port strike", though it is tracked by "port".
+- **Old predictions keep their rules.** Each prediction records the edition of the story-detection rules (`d=2`). A prediction without it is graded against a snapshot built with the 2.1 rules, so upgrading never rescores claims already made. This was checked by replaying 5 archived days with 2.1 and the next 5 with 2.2: all 47 predictions made under 2.1 were graded exactly as a pure 2.1 replay grades them.
+
+#### Results
+
+- **Replay of 10 days of real headlines** (25 October to 3 November 2026, 10 feeds, 5 stories a day). Every story given predictions is now a real story ("donald trump", "midterm election", "budget chancellor", "binance hack", "iran qeshm", "cyber attack" …), against 21 predictions about "up", 21 about "government" and 4 about "bn" before.
+
+  | | 2.1 | 2.2 |
+  |---|---|---|
+  | Brier, all graded | 0.301 | 0.275 |
+  | `TOP5@3` Brier | 0.284 | 0.203 |
+  | `TOP5@7` Brier | 0.294 | 0.198 |
+  | `SHARE_UP@3` Brier | 0.335 | 0.380 |
+  | Skill vs base rate | −0.07 (−0.16 to +0.00) | +0.00 (−0.17 to +0.11) |
+
+  "Still in the top 5" is now a question about stories, and she does much better on it. `SHARE_UP` got worse and remains her weak point. Ten days is too short for the skill intervals to separate.
+- **Three simulated 90-day worlds:** Brier 0.170, 0.179 and 0.177, from 0.178, 0.182 and 0.194, and she now beats the base rate in all three (see [What the report looks like](#what-the-report-looks-like)).
+- **35 demo days:** unchanged within noise (skill −0.02, Brier 0.158); the demo's headlines have no promotions or filler stories.
+- 20 self-tests pass (two new: promotions, amounts and contractions; and generic words with old-rules grading).
+
+#### Why not track stories by their two-word label?
+
+It was considered and rejected. Labels shift from day to day ("donald trump", then "trump administration"), so a lasting story would have been graded as having left the top 5. Single leading words are steadier once generic words are excluded. Proper story identity is on the [roadmap](#roadmap).
 
 ### Version 2.1
 

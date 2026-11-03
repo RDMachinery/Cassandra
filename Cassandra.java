@@ -377,9 +377,21 @@ public class Cassandra {
     static final String BOILERPLATE = "(?i)\\b(continue|keep)\\s+reading\\b[.\\u2026\\s]*"
             + "|(?i)\\bread\\s+(more|the full (story|article))\\b[.\\u2026\\s]*";
 
+    /**
+     * Newsletter and app promotions inside article summaries, added in 2.2. Live feeds carried these on
+     * dozens of Guardian items a day ("Get our breaking news email, free app or daily news podcast",
+     * "Don't get Pushing Buttons delivered to your inbox? Sign up here"), and "sign up" became Cassandra's
+     * most frequent "story". The archive keeps headlines as fetched, so analyse() removes these too:
+     * replays of older archives get the same treatment as new runs.
+     */
+    static final String PROMOS = "(?i)\\bget our [^.?!]{0,60}?email\\s*,?\\s*free app or daily news podcast"
+            + "|(?i)\\bdon[\u2019']?t get [^?]{0,80}?delivered to your inbox\\?\\s*sign up here\\b"
+            + "|(?i)\\bsign up (for|to) [^.?!]{0,100}?\\b(newsletter|email|it)( here)?\\b"
+            + "|(?i)\\bsign up here\\b";
+
     static String clean(String s) {
         return s.replaceAll("<[^>]*>", " ").replaceAll("&[a-z#0-9]+;", " ")
-                .replaceAll(BOILERPLATE, " ").replaceAll("\\s+", " ").trim();
+                .replaceAll(BOILERPLATE, " ").replaceAll(PROMOS, " ").replaceAll("\\s+", " ").trim();
     }
 
     static Instant parseDate(String s) {
@@ -403,10 +415,57 @@ public class Cassandra {
         return (w.length() > 4 && w.endsWith("s") && !w.endsWith("ss")) ? w.substring(0, w.length() - 1) : w;
     }
 
-    static List<String> tokenize(String text) {
+    /**
+     * The edition of the story-detection rules, recorded with each prediction as d=. A prediction is graded
+     * with the rules it was made under, so changing how stories are found never rescores claims already made.
+     * Bump this whenever tokenize, the stopwords, PROMOS or GENERIC change.
+     */
+    static final String STORY_RULES = "2";
+
+    /** Words a headline uses without naming a story, kept out of story detection from 2.2 on (not for tone). */
+    static final Set<String> STOP2 = setOf("up here don doesn didn isn wasn aren weren haven hasn hadn won wouldn "
+            + "couldn shouldn ll ve re via them us many including ago since around ahead come comes came know known long old "
+            + "found yesterday tonight monday tuesday wednesday thursday friday saturday sunday weekend month months "
+            + "january february march april june july august september october november december");
+
+    /**
+     * Words that can be part of a story's label but cannot be the story itself: they turn up in many unrelated
+     * stories. In the first weeks of live runs, "government" stood for six different stories ("form
+     * government", "government spokesperson" ...), so "will it still be in the top 5?" graded a word, not
+     * a story. Tone words (NEG, POS) cannot lead a story either: they describe one rather than name it.
+     */
+    static final Set<String> GENERIC = stemSet("""
+            government state states time times world country countries global four national local public official
+            officials leader leaders president minister ministers party parties court review company companies
+            firm firms business group groups home life work help face cost costs price prices street plan plans
+            call calls move use need want look tell show high big top best next former across part end five six
+            seven eight nine ten hundred thousand million billion resident residents police case cases issue
+            issues change changes city cities man men woman women expert experts living biggest right left
+            family families""");
+
+    /** May this word lead a story? */
+    static boolean canLead(String term) {
+        return !GENERIC.contains(term) && !NEG.contains(term) && !POS.contains(term);
+    }
+
+    /** Words for story detection, by the current rules. */
+    static List<String> tokenize(String text) { return tokenize(text, false); }
+
+    /**
+     * Lower-case, split into words, drop stopwords and stem plurals. From 2.2: promotions are removed first,
+     * "n't" is read as "not" (so "won't" no longer counts as the positive word "won"), and a word containing
+     * a digit is dropped whole, so "$6.3bn" no longer yields a story called "bn". legacy gives the 2.1 rules,
+     * for grading predictions made under them.
+     */
+    static List<String> tokenize(String text, boolean legacy) {
         List<String> out = new ArrayList<>();
-        for (String raw : text.toLowerCase().split("[^a-z]+")) {
+        String t = text.toLowerCase();
+        if (!legacy)
+            t = t.replaceAll(PROMOS, " ").replaceAll("\\bwon[\u2019']t\\b", "will not")
+                    .replaceAll("\\bcan[\u2019']t\\b", "can not").replaceAll("n[\u2019']t\\b", " not");
+        for (String raw : t.split(legacy ? "[^a-z]+" : "[^a-z0-9]+")) {
             if (raw.length() < 2 || STOP.contains(raw)) continue;
+            if (!legacy && (STOP2.contains(raw) || raw.chars().anyMatch(Character::isDigit))) continue;
             String s = stem(raw);
             FORMS.computeIfAbsent(s, k -> new HashMap<>()).merge(raw, 1, Integer::sum);
             out.add(s);
@@ -420,9 +479,11 @@ public class Cassandra {
         return Collections.max(m.entrySet(), Map.Entry.comparingByValue()).getKey();
     }
 
-    static Doc analyse(Article a) {
-        List<String> tokens = tokenize(a.title() + " " + a.body());
-        Set<String> titleTerms = new HashSet<>(tokenize(a.title()));
+    static Doc analyse(Article a) { return analyse(a, false); }
+
+    static Doc analyse(Article a, boolean legacy) {
+        List<String> tokens = tokenize(a.title() + " " + a.body(), legacy);
+        Set<String> titleTerms = new HashSet<>(tokenize(a.title(), legacy));
         return new Doc(a, tokens, new HashSet<>(tokens), titleTerms);
     }
 
@@ -520,6 +581,31 @@ public class Cassandra {
                 .limit(n).map(e -> surface(e.getKey())).toList();
     }
 
+    /**
+     * Today's stories from the headlines: every term in at least three articles, scored as
+     * articles + 1.5 x (outlets - 1) + headline hits, ranked, and merged where their articles overlap.
+     * legacy gives the 2.1 rules (no promotion stripping, digits and generic words allowed), used only to
+     * grade predictions that were made under them.
+     */
+    static Snapshot snapshotOf(List<Article> articles, boolean legacy) {
+        List<Doc> docs = articles.stream().map(a -> analyse(a, legacy)).toList();
+        Map<String, List<Doc>> index = new HashMap<>();
+        for (Doc d : docs) for (String t : d.terms()) index.computeIfAbsent(t, k -> new ArrayList<>()).add(d);
+        Map<String, Double> scores = new HashMap<>();
+        for (var e : index.entrySet()) {
+            List<Doc> ds = e.getValue();
+            if (ds.size() < 3 || (!legacy && !canLead(e.getKey()))) continue;
+            long sources = ds.stream().map(d -> d.article().source()).distinct().count();
+            long titleHits = ds.stream().filter(d -> d.titleTerms().contains(e.getKey())).count();
+            scores.put(e.getKey(), ds.size() + 1.5 * (sources - 1) + titleHits);
+        }
+        List<String> ranked = scores.entrySet().stream()
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed()
+                        .thenComparing(Map.Entry.comparingByKey()))
+                .map(Map.Entry::getKey).toList();
+        return new Snapshot(index, storyReps(ranked, index, 10), docs.size());
+    }
+
     /** Collapse near-duplicate terms ("port", "strike") into one story each, best first. */
     static List<String> storyReps(List<String> ranked, Map<String, List<Doc>> index, int max) {
         List<String> reps = new ArrayList<>();
@@ -581,28 +667,12 @@ public class Cassandra {
 
     static RunResult forecastRunUnlocked(List<Article> articles, Path dir, boolean log, boolean archive)
             throws IOException {
-        List<Doc> docs = articles.stream().map(Cassandra::analyse).toList();
-
         // 1. Index and rank terms
-        Map<String, List<Doc>> index = new HashMap<>();
-        for (Doc d : docs) for (String t : d.terms()) index.computeIfAbsent(t, k -> new ArrayList<>()).add(d);
-
-        Map<String, Double> scores = new HashMap<>();
-        for (var e : index.entrySet()) {
-            List<Doc> ds = e.getValue();
-            if (ds.size() < 3) continue;
-            long sources = ds.stream().map(d -> d.article().source()).distinct().count();
-            long titleHits = ds.stream().filter(d -> d.titleTerms().contains(e.getKey())).count();
-            scores.put(e.getKey(), ds.size() + 1.5 * (sources - 1) + titleHits);
-        }
-        if (scores.isEmpty()) return null;
-        List<String> ranked = scores.entrySet().stream()
-                .sorted(Map.Entry.<String, Double>comparingByValue().reversed()
-                        .thenComparing(Map.Entry.comparingByKey()))
-                .map(Map.Entry::getKey).toList();
-        List<String> reps = storyReps(ranked, index, 10);
-
-        Snapshot snap = new Snapshot(index, reps, docs.size());
+        Snapshot snap = snapshotOf(articles, false);
+        if (snap.reps.isEmpty()) return null;
+        Map<String, List<Doc>> index = snap.index;
+        List<String> reps = snap.reps;
+        Snapshot legacy = null;   // the 2.1 rules, built only if a prediction made under them falls due
 
         // 2. Saved state: history and predictions
         List<HistRow> history = log ? loadHistory(dir) : new ArrayList<>();
@@ -614,7 +684,12 @@ public class Cassandra {
         for (int i = 0; i < preds.size(); i++) {
             Pred p = preds.get(i);
             if (!p.outcome().equals("PENDING")) continue;
-            Pred r = resolve(p, snap);
+            Snapshot s = snap;
+            if (!STORY_RULES.equals(p.feature("d")) && !TODAY.isBefore(p.due())) {
+                if (legacy == null) legacy = snapshotOf(articles, true);
+                s = legacy;   // graded by the rules it was made under
+            }
+            Pred r = resolve(p, s);
             if (r != p) {
                 preds.set(i, r);
                 if (r.graded()) gradedNow.add(r);
@@ -653,7 +728,7 @@ public class Cassandra {
         for (int i = 1; i < Math.min(4, reps.size()); i++)
             others.add(new Other(bestPhrase(reps.get(i), index.get(reps.get(i))), index.get(reps.get(i)).size()));
 
-        RunResult result = new RunResult(TODAY, docs.size(), top, domain, sources, related, anyPriorRuns, fresh,
+        RunResult result = new RunResult(TODAY, snap.total, top, domain, sources, related, anyPriorRuns, fresh,
                 toAdd.size(), log, gradedNow, record, preds, samples, others, scenario(lead, domain, related, sources));
         if (log) saveLatest(dir, result);
         if (archive) saveArchive(dir, articles);
@@ -890,7 +965,7 @@ public class Cassandra {
         String key = kind + "@" + days;
         double guess = calibrate(firstGuess, guessRecord(known, key));
         double[] b = fromBaseRate(known, key, guess, evidence);
-        String features = String.join(";", evidence) + ";g=" + GUESS_RULES;
+        String features = String.join(";", evidence) + ";g=" + GUESS_RULES + ";d=" + STORY_RULES;
         double p;
         if (b != null) {
             p = b[0];
@@ -2279,6 +2354,28 @@ public class Cassandra {
             try { parseFeed(evil.getBytes(StandardCharsets.UTF_8), "x"); refused = false; }
             catch (Exception e) { refused = true; }
             expect(refused, "a feed with a DOCTYPE (XXE attack) is refused");
+        });
+
+        checks.put("Story words: promotions, amounts, contractions", () -> {
+            List<String> t = tokenize("Binance denies $6.3bn hack. Don’t get Pushing Buttons delivered to your "
+                    + "inbox? Sign up here. Get our breaking news email, free app or daily news podcast. "
+                    + "Ministers won’t act, sign up for the Politics newsletter here");
+            expect(t.contains("binance") && t.contains("hack"), "real words kept: " + t);
+            expect(!t.contains("bn") && !t.contains("sign") && !t.contains("up"), "no 'bn', 'sign' or 'up': " + t);
+            expect(!t.contains("pushing") && !t.contains("podcast") && !t.contains("newsletter"), "promotions gone: " + t);
+            expect(!t.contains("won"), "\"won't\" is not the positive word \"won\": " + t);
+            expect(tokenize("Sign up here", true).contains("sign"), "the 2.1 rules are unchanged for old predictions");
+        });
+
+        checks.put("Generic words can't be stories; old predictions graded by old rules", () -> {
+            List<Article> as = new ArrayList<>();
+            for (int i = 0; i < 4; i++) as.add(new Article("s" + i, "Government spokesperson speaks " + i,
+                    "Sign up here for more", NOW, ""));
+            for (int i = 0; i < 3; i++) as.add(new Article("s" + i, "Binance hack inquiry " + i, "", NOW, ""));
+            Snapshot now = snapshotOf(as, false), old = snapshotOf(as, true);
+            expect(!now.reps.contains("government") && !now.reps.contains("up"), "no generic stories: " + now.reps);
+            expect(now.reps.contains("binance") || now.reps.contains("hack"), "the real story leads: " + now.reps);
+            expect(old.inTop5("up") && !now.inTop5("up"), "'up' was a story under 2.1 rules only");
         });
 
         checks.put("Duplicate headlines removed; text wrapping; CSV quoting", () -> {
@@ -4631,7 +4728,7 @@ public class Cassandra {
             }
         }
 
-        static final String VERSION = "2.1";
+        static final String VERSION = "2.2";
         static final String REPO = REPO_URL;
 
         void showAbout() {

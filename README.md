@@ -54,7 +54,16 @@ Her predictions are about **news coverage** (what will be in the headlines), not
 
 **On real news, not yet.** On 2 November 2026, after about two weeks of daily runs, she had 91 graded predictions, and on the 41 that can be compared she was doing **worse** than "what usually happens" (skill −0.22, margin of error −0.34 to −0.13). Her biggest weakness was clear: she expected stories to grow and change far more often than they did. She gave "this story will get a bigger share of the headlines" about a 50% chance, and it happened 25% of the time. Meanwhile she under-rated how often stories simply stay put.
 
-Most of those predictions were made before she learned to start from her record, using hand-set first guesses that were too eager for change. Version 2.1 rewrites those guesses and changes how she moves from her guesses to her record (see [What changed in 2.1](#what-changed-in-21)). Her accuracy report now also splits her score by how each probability was set, so it's easy to see whether the old guesses are still dragging the total down. This section will be updated as the record grows.
+Her report shows where that score comes from: 52 of those 53 predictions were her hand-set first guesses, made before she learned to start from her record. Versions 2.1 and 2.2 fix the two problems the live record revealed. 2.1 rewrote those over-eager guesses (see [What changed in 2.1](#what-changed-in-21)). 2.2 fixes how she finds stories: a third of her "stories" were really newsletter adverts or everyday words (see [What changed in 2.2](#what-changed-in-22)).
+
+**Replaying the same 10 days of real headlines** (25 October to 3 November) shows what each version would have done:
+
+| Version | Brier score (lower is better) | Skill vs "what usually happens" |
+|---|---|---|
+| 2.1 | 0.301 | −0.07 (−0.16 to +0.00) |
+| 2.2 | 0.275 | +0.00 (−0.17 to +0.11) |
+
+That's a clear step forward, but ten days is far too short to call. She is still worse than a coin flip (0.250) on these days, mostly because "a bigger share of the headlines" remains hard for her. This section will be updated as the record grows.
 
 What can be said is how she's judged, and that the test is deliberately hard to pass. Her predictions are compared with two simple opponents:
 
@@ -64,6 +73,13 @@ What can be said is how she's judged, and that the test is deliberately hard to 
 Her score is a single **skill** number: above zero means she beats "what usually happens", zero means she's no better, and below zero means she's worse. It comes with a margin of error, and she won't give a verdict at all until there are enough results to be fair.
 
 **On demo data:** over 35 demo days she beats a coin flip easily and can't be told apart from "what usually happens" (skill −0.02, margin of error −0.08 to +0.03). Version 2.0 scored −0.04 on the same days, which was measurably worse. Level is the expected result, because the demo headlines are random draws following fixed storylines, so there's little to read beyond the usual patterns. Whether she can do better than common sense on real news is exactly what her live record will show.
+
+### What changed in 2.2
+
+- **Newsletter adverts are no longer news.** Guardian summaries carry promotions such as "Don't get Pushing Buttons delivered to your inbox? Sign up here". "Sign up" had become her most frequent story. These are now removed, including from headlines already in the archive, so replays benefit too.
+- **Everyday words can't be stories.** Words such as "government", "state" and "time" turn up in many unrelated stories: "government" alone stood for six of them. Such words can still appear in a story's label, but can no longer *be* the story. The same goes for tone words such as "attack" or "deal", which describe a story rather than name it.
+- **Amounts and contractions are read properly.** "$6.3bn" no longer produces a story called "bn", and "won't" no longer counts as the positive word "won".
+- **Pending predictions are judged fairly.** A prediction is checked using the rules it was made under, so the new rules never rescore claims made before them.
 
 ### What changed in 2.1
 
@@ -227,7 +243,7 @@ Add `--data=FOLDER` to any of these to use a different data folder. If you haven
 - **Don't use her for decisions** about money, politics or safety.
 - **She's only as good as her record shows.** With a short record her probabilities are rough, and early on they're educated guesses.
 - **She sees what the outlets choose to publish.** News coverage reflects editors' decisions, not the importance of events.
-- **Her language skills are basic.** She tracks stories by their key words, so a story can occasionally be split in two or mistaken for a new one, and her sense of tone is a simple word count that misses sarcasm and negation.
+- **Her language skills are basic.** She tracks stories by their key words, so a story can occasionally be split in two or mistaken for a new one, and two different stories that share a word can be treated as one. Her sense of tone is a simple word count that misses sarcasm and most negation.
 - **She needs to run daily.** Missed days leave predictions that can't be checked.
 - **English-language RSS feeds only.**
 
@@ -242,7 +258,8 @@ When she fetches a news feed, Cassandra sends only a standard request for that f
 - **Fairer tone predictions.** At the moment a tone prediction is set aside as "void" when the story has almost left the news, which is exactly when it's most likely to have failed. It should count as a miss.
 - **Harder kinds of prediction**, such as "the leading story will still lead in three days" or "a fast-growing story just outside the top five will break into it".
 - **More kinds of prediction**, such as "more outlets will be covering this story in three days".
-- **Better story tracking**, so a story is followed correctly even when the words used to describe it change.
+- **Better story tracking**, so a story is followed correctly even when the words used to describe it change, and two stories that share a word ("midterm election", "Israel election") are kept apart.
+- **Better "bigger share" predictions.** On real headlines this is her weakest kind of prediction: she can't yet tell which stories will grow.
 - **Better tone reading**, so "not good" isn't counted as positive.
 - **Support for Atom feeds** as well as RSS, and friendlier fetching that skips feeds that haven't changed.
 
