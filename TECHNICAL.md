@@ -321,7 +321,7 @@ What the latest run found (see the screenshot at the top of the README). It read
 | Latest headlines | Up to 5 recent headlines about the selected story | Blue, underlined headlines open in your browser. |
 | What may follow | The template scenario for the top story, and the other storylines to watch | Not a prediction and not graded: it reads plausibly whatever happens. |
 
-![The Accuracy tab: verdict banner, headline figures, reliability diagram, weekly Brier scores and per-type table](accuracy-tab.png)
+![The Accuracy tab: verdict banner, headline figures, reliability diagram, weekly Brier scores and per-type table](accuracy-tab-3.png)
 
 #### Accuracy tab
 
