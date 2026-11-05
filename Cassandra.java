@@ -876,7 +876,11 @@ public class Cassandra {
      * outweigh it six to one. (Until version 2.1 she switched abruptly from her guess to the base rate at
      * the fifth result, trusting a rate measured on five results completely.)
      *
-     * Returns {probability, base rate, results}, or null while the type has no graded result yet.
+     * The evidence then has to earn its say (from 2.3): the probability issued is
+     * start + w x (evidence-based - start), where w is the weight the evidence has earned (evidenceWeight).
+     *
+     * Returns {probability, base rate, results, start, evidence-based, weight}, or null while the type has
+     * no graded result yet.
      */
     static double[] fromBaseRate(List<Pred> known, String key, double guess, String... evidence) {
         List<Pred> group = known.stream()
@@ -887,13 +891,42 @@ public class Cassandra {
         double base = (hits0 + 0.5) / (n0 + 1.0);
         double w = MIN_FOR_CALIBRATION;
         double p = (hits0 + w * guess) / (n0 + w);
+        double start = clamp(p, 0.03, 0.97);
         for (String e : evidence) {
             String[] kv = e.split("=", 2);
             group = group.stream().filter(x -> kv[1].equals(x.feature(kv[0]))).toList();
             long hits = group.stream().filter(x -> x.outcome().equals("TRUE")).count();
             p = (hits + BASE_PRIOR_WEIGHT * p) / (group.size() + BASE_PRIOR_WEIGHT);
         }
-        return new double[]{clamp(p, 0.03, 0.97), base, n0};
+        double ev = clamp(p, 0.03, 0.97), wt = evidenceWeight(known, key);
+        return new double[]{clamp(start + wt * (ev - start), 0.03, 0.97), base, n0, start, ev, wt};
+    }
+
+    static final int EVIDENCE_PRIOR = 20;   // results before the evidence's own record counts half
+
+    /**
+     * How much say the evidence (rank, momentum, trend ...) has earned for this prediction type, from 0 to 1.
+     * Each prediction made since 2.3 records two probabilities: where she started (q=, the base rate blended
+     * with her first guess) and where the evidence took her (e=). Over the type's graded results known today,
+     * the weight w that would have scored best is found by least squares, w* = sum (e - q)(y - q) / sum (e - q)^2,
+     * kept between 0 and 1, then shrunk by n / (n + EVIDENCE_PRIOR). So the evidence has no say until it has
+     * shown on her own record that it helps; when it has pointed the wrong way, w* is 0 and she sticks with
+     * the start. Both probabilities were made before the outcome was known, so this is an honest test.
+     */
+    static double evidenceWeight(List<Pred> known, String key) {
+        double num = 0, den = 0;
+        int n = 0;
+        for (Pred p : known) {
+            if (!p.graded() || !p.key().equals(key) || resolvedOn(p).isAfter(TODAY)) continue;
+            String q = p.feature("q"), e = p.feature("e");
+            if (q == null || e == null) continue;
+            double dq = Double.parseDouble(q), d = Double.parseDouble(e) - dq, y = p.outcome().equals("TRUE") ? 1 : 0;
+            num += d * (y - dq);
+            den += d * d;
+            n++;
+        }
+        if (n == 0 || den < 1e-9) return 0;
+        return clamp(num / den, 0, 1) * n / (n + (double) EVIDENCE_PRIOR);
     }
 
     /** How long a story has already held on: consecutive earlier days in the top 5, as an evidence bucket. */
@@ -944,12 +977,14 @@ public class Cassandra {
         out.add(pred(term, label, "SHARE_UP", 3, String.format(Locale.ROOT, "%.4f", shareNow),
                 clamp(up, 0.05, 0.95), known, "t=" + trendBucket(fc), m, r));
 
-        // will the tone persist? Tone belongs to the story more than to the day, so it usually does
+        // Will it still be in the news with the same tone? Tone belongs to the story more than to the day, so
+        // it usually holds, but the story must also still be there: a story that fades counts as a miss.
+        // (TONE_PERSIST, used until 2.2, was voided when the story faded, hiding exactly the likeliest misses.)
         if (tone != Tone.MIXED) {
             double a = Math.abs(net);
-            double pt = a >= 1.5 ? 0.82 : a >= 1.0 ? 0.75 : 0.68;
-            out.add(pred(term, label, "TONE_PERSIST", 3, tone == Tone.NEGATIVE ? "NEG" : "POS", pt, known,
-                    "s=" + (a >= 1.5 ? "strong" : a >= 1.0 ? "medium" : "mild")));
+            double pt = (a >= 1.5 ? 0.82 : a >= 1.0 ? 0.75 : 0.68) * clamp(0.92 - 0.04 * (s.rank() - 1), 0.5, 1);
+            out.add(pred(term, label, "TONE_HOLDS", 3, tone == Tone.NEGATIVE ? "NEG" : "POS", pt, known,
+                    "s=" + (a >= 1.5 ? "strong" : a >= 1.0 ? "medium" : "mild"), r));
         }
         return out;
     }
@@ -969,7 +1004,7 @@ public class Cassandra {
         double p;
         if (b != null) {
             p = b[0];
-            features += String.format(Locale.ROOT, ";b=%.4f;n=%d", b[1], (int) b[2]);
+            features += String.format(Locale.ROOT, ";b=%.4f;n=%d;q=%.4f;e=%.4f;w=%.2f", b[1], (int) b[2], b[3], b[4], b[5]);
         } else {
             p = guess;
         }
@@ -985,6 +1020,8 @@ public class Cassandra {
                     + p.made() + " (" + String.format(Locale.ROOT, "%.0f%%", Double.parseDouble(p.param()) * 100) + ").";
             case "TONE_PERSIST" -> "On " + p.due() + ", coverage of \"" + p.label() + "\" will still be clearly "
                     + (p.param().equals("NEG") ? "negative" : "positive") + " in tone.";
+            case "TONE_HOLDS" -> "On " + p.due() + ", \"" + p.label() + "\" will still be in the news, with coverage "
+                    + "still clearly " + (p.param().equals("NEG") ? "negative" : "positive") + " in tone.";
             default -> p.kind() + " " + p.label();
         };
     }
@@ -996,6 +1033,7 @@ public class Cassandra {
             case "TOP5" -> "Still in the top 5";
             case "SHARE_UP" -> "Larger share of headlines";
             case "TONE_PERSIST" -> "Tone stays the same";
+            case "TONE_HOLDS" -> "Still in the news, same tone";
             default -> k[0];
         };
         return what + " after " + (k.length > 1 ? k[1] : "?") + " days";
@@ -1017,6 +1055,7 @@ public class Cassandra {
             case "SHARE_UP" -> "Bigger share than "
                     + String.format(Locale.ROOT, "%.0f%%", Double.parseDouble(p.param()) * 100);
             case "TONE_PERSIST" -> "Coverage still " + (p.param().equals("NEG") ? "negative" : "positive");
+            case "TONE_HOLDS" -> "In the news, still " + (p.param().equals("NEG") ? "negative" : "positive");
             default -> p.kind();
         };
     }
@@ -1053,6 +1092,12 @@ public class Cassandra {
                 OptionalDouble n = s.net(p.term());
                 if (n.isEmpty()) return p.with("VOID", TODAY.toString());
                 boolean hit = p.param().equals("NEG") ? n.getAsDouble() <= -0.5 : n.getAsDouble() >= 0.5;
+                return p.with(String.valueOf(hit).toUpperCase(), TODAY.toString());
+            }
+            case "TONE_HOLDS": {   // as above, but a story with too few headlines to measure has faded: a miss
+                OptionalDouble n = s.net(p.term());
+                boolean hit = n.isPresent()
+                        && (p.param().equals("NEG") ? n.getAsDouble() <= -0.5 : n.getAsDouble() >= 0.5);
                 return p.with(String.valueOf(hit).toUpperCase(), TODAY.toString());
             }
             default:
@@ -1326,6 +1371,7 @@ public class Cassandra {
     /** How a prediction's probability was set, judged from the evidence recorded with it. */
     static String method(Pred p) {
         if (p.feature("b") == null) return "Hand-set first guess";
+        if (p.feature("w") != null) return "Evidence weighed by its record (2.3)";
         return p.feature("g") == null ? "Base rate + evidence (2.0 rules)" : "Record blended with first guess (2.1)";
     }
 
@@ -1425,6 +1471,7 @@ public class Cassandra {
 
         // ---- by method
         printByMethod(a);
+        printEvidence(a.graded());
 
         // ---- reliability
         System.out.println("\nRELIABILITY (when she says X%, does it happen X% of the time?)");
@@ -2236,9 +2283,10 @@ public class Cassandra {
             double start = (6 + w * guess) / (10 + w);   // her guess counts as w results alongside the record
             near(fromBaseRate(known, "TOP5@3", guess)[1], (6 + 0.5) / 11.0, "the type's base rate is reported");
             near(fromBaseRate(known, "TOP5@3", guess)[0], start, "no evidence: base rate blended with her guess");
-            near(fromBaseRate(known, "TOP5@3", guess, "r=1")[0], (6 + BASE_PRIOR_WEIGHT * start) / (6 + BASE_PRIOR_WEIGHT),
-                    "rank 1 pulled towards its own record");
-            near(fromBaseRate(known, "TOP5@3", guess, "r=3")[0], start, "no rank-3 results: stays at the start");
+            near(fromBaseRate(known, "TOP5@3", guess, "r=1")[4], (6 + BASE_PRIOR_WEIGHT * start) / (6 + BASE_PRIOR_WEIGHT),
+                    "the evidence: rank 1 pulled towards its own record");
+            near(fromBaseRate(known, "TOP5@3", guess, "r=1")[0], start, "evidence with no record of its own: no say");
+            near(fromBaseRate(known, "TOP5@3", guess, "r=3")[4], start, "no rank-3 results: stays at the start");
             expect(fromBaseRate(known, "TOP5@3", guess, "r=3")[2] == 10, "results counted for the whole type");
             double gap10 = fromBaseRate(known, "TOP5@3", 0.9)[0] - fromBaseRate(known, "TOP5@3", 0.1)[0];
             List<Pred> more = new ArrayList<>(known);
@@ -2252,6 +2300,33 @@ public class Cassandra {
             near(early[0], (2 + w * guess) / (4 + w), "results not yet known are ignored");
             TODAY = d0.plusDays(2);
             expect(fromBaseRate(known, "TOP5@3", guess) == null, "nothing graded yet: use the first guess");
+        });
+
+        checks.put("Evidence earns its say", () -> {
+            TODAY = d0.plusDays(40);
+            List<Pred> helps = new ArrayList<>(), hurts = new ArrayList<>();
+            for (int i = 0; i < 30; i++) {   // the start says 50%; the evidence says 80% or 20%
+                boolean up = i % 2 == 0;
+                String f = "q=0.5000;e=" + (up ? "0.8000" : "0.2000");
+                helps.add(testPred("h-" + i, d0.plusDays(i), 3, "TOP5", up ? "TRUE" : "FALSE", 0.5, f));
+                hurts.add(testPred("x-" + i, d0.plusDays(i), 3, "TOP5", up ? "FALSE" : "TRUE", 0.5, f));
+            }
+            double wh = evidenceWeight(helps, "TOP5@3");
+            near(wh, 30.0 / (30 + EVIDENCE_PRIOR), "evidence that is always right earns its full say, shrunk by its count");
+            near(evidenceWeight(hurts, "TOP5@3"), 0, "evidence that points the wrong way gets no say");
+            near(evidenceWeight(List.of(), "TOP5@3"), 0, "no record: no say");
+            List<Pred> older = new ArrayList<>();   // predictions without q= and e= (before 2.3) don't count
+            for (int i = 0; i < 10; i++) older.add(testPred("o-" + i, d0.plusDays(i), 3, "TOP5", "TRUE", 0.5, "r=1"));
+            near(evidenceWeight(older, "TOP5@3"), 0, "predictions from before 2.3 are ignored");
+        });
+
+        checks.put("A fading story is a miss for TONE_HOLDS, a void for TONE_PERSIST", () -> {
+            TODAY = d0.plusDays(3);
+            Snapshot empty = new Snapshot(new HashMap<>(), List.of(), 100);
+            Pred holds = testPred("t1", d0, 3, "TONE_HOLDS", "PENDING", 0.7, "");
+            Pred persist = testPred("t2", d0, 3, "TONE_PERSIST", "PENDING", 0.7, "");
+            expect(resolve(holds.with("PENDING", "-"), empty).outcome().equals("FALSE"), "TONE_HOLDS: faded = miss");
+            expect(resolve(persist.with("PENDING", "-"), empty).outcome().equals("VOID"), "TONE_PERSIST: faded = void");
         });
 
         checks.put("First guesses learn only from guesses made under the current rules", () -> {
@@ -2722,12 +2797,51 @@ public class Cassandra {
     /** How a prediction's probability was arrived at, for the report. */
     static String startingPoint(Pred p) {
         String b = p.feature("b");
+        if (p.feature("w") != null) return " [" + explainEvidence(p) + "]";
         if (b != null && p.feature("n") != null)
             return " [base rate " + pct(Double.parseDouble(b)) + " over " + p.feature("n") + (p.feature("n").equals("1") ? " result" : " results") + " and first guess "
                     + pct(p.pRaw()) + ", adjusted for the evidence]";
         if (b != null)
             return " [from the base rate of " + pct(Double.parseDouble(b)) + "; first guess " + pct(p.pRaw()) + "]";
         return Math.abs(p.p() - p.pRaw()) > 1e-9 ? " [recalibrated from " + pct(p.pRaw()) + "]" : "";
+    }
+
+    /** Where a 2.3 probability came from, in words: the start, what the evidence said, and its say. */
+    static String explainEvidence(Pred p) {
+        String n = p.feature("n");
+        String start = "base rate " + pct(Double.parseDouble(p.feature("b"))) + " over " + n
+                + (n.equals("1") ? " result" : " results") + " and first guess " + pct(p.pRaw()) + " give "
+                + pct(Double.parseDouble(p.feature("q")));
+        double w = Double.parseDouble(p.feature("w"));
+        return start + (w < 0.005 ? "; the evidence (" + pct(Double.parseDouble(p.feature("e")))
+                + ") has not yet earned a say"
+                : "; the evidence says " + pct(Double.parseDouble(p.feature("e"))) + " and has earned "
+                + pct(w) + " of a say");
+    }
+
+    /**
+     * For each prediction type, whether its evidence has helped: the Brier score of where she started (q=)
+     * against where the evidence took her (e=), on graded predictions that recorded both, and the weight the
+     * evidence has earned as of today.
+     */
+    static void printEvidence(List<Pred> preds) {
+        Map<String, List<Pred>> by = new TreeMap<>();
+        for (Pred p : preds)
+            if (p.graded() && p.feature("q") != null && p.feature("e") != null)
+                by.computeIfAbsent(p.key(), k -> new ArrayList<>()).add(p);
+        if (by.isEmpty()) return;
+        System.out.println("\nHAS THE EVIDENCE EARNED ITS SAY? (predictions made since 2.3)");
+        System.out.println("  type             graded  Brier without  Brier with  weight now");
+        for (var e : by.entrySet()) {
+            List<Pred> ps = e.getValue();
+            double q = brier(ps, x -> Double.parseDouble(x.feature("q")));
+            double ev = brier(ps, x -> Double.parseDouble(x.feature("e")));
+            System.out.println(String.format(Locale.ROOT, "  %-15s %7d  %13.3f  %10.3f  %9.0f%%", e.getKey(), ps.size(),
+                    q, ev, 100 * evidenceWeight(preds, e.getKey())));
+        }
+        System.out.println(wrap("\"Without\" is the base rate blended with her first guess; \"with\" is where the "
+                + "evidence (rank, momentum, trend, tone strength, days in the top 5) would have taken her. The "
+                + "evidence only gets a say where it has scored better, and its weight grows with the results.", "  "));
     }
 
     /** Each row = one time horizon; column 0 = negative-leaning, column 1 = positive-leaning. */
@@ -3148,6 +3262,8 @@ public class Cassandra {
                         + String.format(Locale.ROOT, "%.0f%%", Double.parseDouble(p.param()) * 100) + " on " + due;
                 case "TONE_PERSIST" -> "Coverage still " + (p.param().equals("NEG") ? "negative" : "positive")
                         + " on " + due;
+                case "TONE_HOLDS" -> "In the news and still " + (p.param().equals("NEG") ? "negative" : "positive")
+                        + " on " + due;
                 default -> p.kind() + " on " + due;
             };
         }
@@ -3257,7 +3373,9 @@ public class Cassandra {
             ProbBar(Pred p) {
                 this.p = p;
                 setPreferredSize(new Dimension(122, 18));
-                setToolTipText(p.feature("n") != null
+                setToolTipText(p.feature("w") != null
+                        ? "From the " + explainEvidence(p)
+                        : p.feature("n") != null
                         ? "Her first guess (" + pct(p.pRaw()) + ") blended with the base rate for this type ("
                         + pct(Double.parseDouble(p.feature("b"))) + " over " + p.feature("n")
                         + (p.feature("n").equals("1") ? " result" : " results") + "), adjusted for the evidence"
@@ -3994,7 +4112,8 @@ public class Cassandra {
                 String what = switch (k[0]) {
                     case "TOP5" -> "Top 5";
                     case "SHARE_UP" -> "Share up";
-                    case "TONE_PERSIST" -> "Tone holds";
+                    case "TONE_PERSIST" -> "Tone persists";
+                    case "TONE_HOLDS" -> "Tone holds";
                     default -> k[0];
                 };
                 return what + " · " + (k.length > 1 ? k[1] : "?") + "d";
@@ -4728,7 +4847,7 @@ public class Cassandra {
             }
         }
 
-        static final String VERSION = "2.2";
+        static final String VERSION = "2.3";
         static final String REPO = REPO_URL;
 
         void showAbout() {

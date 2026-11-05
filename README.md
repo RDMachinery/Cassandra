@@ -42,10 +42,10 @@ Each time she runs, Cassandra:
    |---|---|
    | It will still be among the top five stories | 3 days, and again after 7 |
    | It will take a bigger share of the headlines than today | 3 days |
-   | Its coverage will still be clearly negative (or positive) | 3 days |
+   | It will still be in the news, with coverage still clearly negative (or positive) | 3 days |
 
 5. **Grades earlier predictions.** Any prediction that has fallen due is marked as *came true* or *didn't happen*, automatically. Nobody can change the outcome by hand.
-6. **Learns from her record.** Each prediction starts from two things: her own first guess, and how often that kind of prediction has come true so far. At first her guess counts for most; as results come in, her record takes over. She then weighs clues such as a story's rank, its momentum and how many days it has already lasted, but each clue only moves her as far as her record shows it matters.
+6. **Learns from her record.** Each prediction starts from two things: her own first guess, and how often that kind of prediction has come true so far. At first her guess counts for most; as results come in, her record takes over. She also has clues, such as a story's rank, its momentum and how many days it has already lasted. But the clues have to earn their say: she records what they suggested each time, and only lets them move her once her record shows they've helped.
 7. **Writes a short scenario** of what may follow for the top story. This is a hand-written template, not a prediction, and it's labelled as such.
 
 Her predictions are about **news coverage** (what will be in the headlines), not about events themselves. "The port strike will still be a top story on Saturday" is something she can check; "the strike will end by Saturday" is not.
@@ -54,16 +54,17 @@ Her predictions are about **news coverage** (what will be in the headlines), not
 
 **On real news, not yet.** On 2 November 2026, after about two weeks of daily runs, she had 91 graded predictions, and on the 41 that can be compared she was doing **worse** than "what usually happens" (skill −0.22, margin of error −0.34 to −0.13). Her biggest weakness was clear: she expected stories to grow and change far more often than they did. She gave "this story will get a bigger share of the headlines" about a 50% chance, and it happened 25% of the time. Meanwhile she under-rated how often stories simply stay put.
 
-Her report shows where that score comes from: 52 of those 53 predictions were her hand-set first guesses, made before she learned to start from her record. Versions 2.1 and 2.2 fix the two problems the live record revealed. 2.1 rewrote those over-eager guesses (see [What changed in 2.1](#what-changed-in-21)). 2.2 fixes how she finds stories: a third of her "stories" were really newsletter adverts or everyday words (see [What changed in 2.2](#what-changed-in-22)).
+Her report shows where that score comes from: 52 of those 53 predictions were her hand-set first guesses, made before she learned to start from her record. Versions 2.1 to 2.3 fix the problems the live record revealed. 2.1 rewrote those over-eager guesses. 2.2 fixed how she finds stories: a third of her "stories" were really newsletter adverts or everyday words. 2.3 stops her clues from misleading her: on real headlines they were pointing the wrong way. See [What changed](#what-changed-in-23).
 
-**Replaying the same 10 days of real headlines** (25 October to 3 November) shows what each version would have done:
+**Replaying the same 12 days of real headlines** (25 October to 5 November) shows what each version would have done:
 
 | Version | Brier score (lower is better) | Skill vs "what usually happens" |
 |---|---|---|
-| 2.1 | 0.301 | −0.07 (−0.16 to +0.00) |
-| 2.2 | 0.275 | +0.00 (−0.17 to +0.11) |
+| 2.1 | 0.288 | −0.07 (−0.14 to −0.02) |
+| 2.2 | 0.267 | −0.05 (−0.16 to +0.05) |
+| 2.3 | 0.256 | +0.02 (−0.03 to +0.08) |
 
-That's a clear step forward, but ten days is far too short to call. She is still worse than a coin flip (0.250) on these days, mostly because "a bigger share of the headlines" remains hard for her. This section will be updated as the record grows.
+Each version is better than the one before, and 2.3 is the first that isn't behind "what usually happens". But twelve days is far too short to call. She is still worse than a coin flip (0.250) on these days, mostly because "a bigger share of the headlines" remains hard for her. This section will be updated as the record grows.
 
 What can be said is how she's judged, and that the test is deliberately hard to pass. Her predictions are compared with two simple opponents:
 
@@ -72,7 +73,12 @@ What can be said is how she's judged, and that the test is deliberately hard to 
 
 Her score is a single **skill** number: above zero means she beats "what usually happens", zero means she's no better, and below zero means she's worse. It comes with a margin of error, and she won't give a verdict at all until there are enough results to be fair.
 
-**On demo data:** over 35 demo days she beats a coin flip easily and can't be told apart from "what usually happens" (skill −0.02, margin of error −0.08 to +0.03). Version 2.0 scored −0.04 on the same days, which was measurably worse. Level is the expected result, because the demo headlines are random draws following fixed storylines, so there's little to read beyond the usual patterns. Whether she can do better than common sense on real news is exactly what her live record will show.
+**On demo data:** over 35 demo days she beats a coin flip easily and is almost exactly level with "what usually happens" (skill −0.01, margin of error −0.03 to −0.00). Strictly, that's a measurable shortfall, but a tiny one: 0.184 against 0.181 on the Brier score. Level is the expected result, because the demo headlines are random draws following fixed storylines, so there's little to read beyond the usual patterns. Whether she can do better than common sense on real news is exactly what her live record will show.
+
+### What changed in 2.3
+
+- **Her clues have to earn their say.** Each prediction now records two probabilities: where she started (her record blended with her first guess), and where her clues (rank, momentum, trend, tone strength, days in the top five) would have taken her. Once results come in, she works out how much weight the clues would have deserved, and gives them that much and no more. On real headlines so far, the clues would have made every kind of prediction worse, so for now they have no say at all. In simulated news, where they do help, they had earned between a fifth and nine-tenths of a say after three months, depending on the kind of prediction. Her accuracy report has a new table showing how much say each kind of clue has earned.
+- **A story that fades no longer escapes.** The tone prediction is now "it will still be in the news, with coverage still negative". Before, if a story had almost left the news, its tone prediction was quietly set aside as void, even though that's exactly when it was most likely to have failed. In simulated news, up to a third of tone predictions were being set aside this way. Tone predictions made before 2.3 keep their old rule.
 
 ### What changed in 2.2
 
@@ -141,7 +147,7 @@ The window shows everything Cassandra knows, in six tabs. It updates by itself a
 
 **Accuracy** answers "is she any good?" at a glance. A coloured banner gives the verdict: green if she's beating "what usually happens", red if she's worse, amber if it's too close to call, grey if it's too early to say. The chart on the left shows whether things she calls 70% likely really happen about 70% of the time.
 
-![The Accuracy tab: the verdict, headline scores, a chart of how well her probabilities match reality, and her score week by week](accuracy-tab-2.png)
+![The Accuracy tab: the verdict, headline scores, a chart of how well her probabilities match reality, and her score week by week](accuracy-tab.png)
 
 **Predictions** lists every prediction she has ever made, with its outcome. You can sort it, filter it (for example to show only the predictions that didn't happen), search for a story, and save the list as a spreadsheet file. A line above the table shows how well she did on whatever is currently shown.
 
@@ -254,12 +260,11 @@ When she fetches a news feed, Cassandra sends only a standard request for that f
 ## Plans
 
 - **Test her methods on real news.** After a few weeks of daily runs, replaying the archive will show which clues really help, and which should be dropped.
-- **Clues that earn their say.** Score each kind of prediction's clues against the plain base rate, and give them less weight when they haven't helped.
-- **Fairer tone predictions.** At the moment a tone prediction is set aside as "void" when the story has almost left the news, which is exactly when it's most likely to have failed. It should count as a miss.
 - **Harder kinds of prediction**, such as "the leading story will still lead in three days" or "a fast-growing story just outside the top five will break into it".
 - **More kinds of prediction**, such as "more outlets will be covering this story in three days".
 - **Better story tracking**, so a story is followed correctly even when the words used to describe it change, and two stories that share a word ("midterm election", "Israel election") are kept apart.
 - **Better "bigger share" predictions.** On real headlines this is her weakest kind of prediction: she can't yet tell which stories will grow.
+- **Better clues.** Once her clues have a few weeks of real results, the report will show which ones help. The ones that never earn a say can be replaced with better ones.
 - **Better tone reading**, so "not good" isn't counted as positive.
 - **Support for Atom feeds** as well as RSS, and friendlier fetching that skips feeds that haven't changed.
 
