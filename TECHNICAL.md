@@ -1,6 +1,6 @@
 # Cassandra: technical guide
 
-The detail behind the [README](../README.md), for version 2.3: how Cassandra is scored, how a run works, the files she saves, every setting, the command-line options, replay, publishing, the self-test and the version history.
+The detail behind the [README](../README.md), for version 2.4: how Cassandra is scored, how a run works, the files she saves, every setting, the command-line options, replay, publishing, the self-test and the version history.
 
 ## Contents
 
@@ -35,14 +35,26 @@ The headline number is the **skill score**, `1 − Brier(Cassandra) / Brier(base
 To stop the report flattering her:
 
 - **No verdict until there is evidence.** The base-rate forecaster needs 5 earlier results of a type before it makes a forecast, and the report gives no verdict until 30 predictions can be compared.
-- **An honest margin of error.** The 90% interval on the skill score is bootstrapped by resampling *whole days*, because predictions made on the same day are about the same stories and tend to succeed or fail together.
+- **An honest margin of error.** The 90% interval on the skill score is bootstrapped twice: once resampling *whole days* (predictions made on the same day are about the same day's news), and once resampling *whole stories* (the same story is predicted about on several days running). Both kinds of prediction tend to succeed or fail together. The verdict uses the wider range, the lower of the two lower ends and the higher of the two upper ends, and the report shows both. With fewer than 10 stories, the report adds that even the wider range is rough, because resampling only a few stories understates the uncertainty.
 - **Three possible verdicts:** she beats the base rate (the whole interval is above 0), she is worse (the whole interval is below 0), or she cannot yet be told apart from it.
 - **Where she goes wrong.** A reliability table shows, for each band of forecasts (0–20%, 20–40% …), how often those claims actually came true.
 
 
 ### Live track record
 
-The full `--report` output from Cassandra's first live record: 170 predictions graded between 6 and 21 November 2026, on the default BBC and Guardian feeds.
+**Re-scored under 2.4 on 21 November 2026:** the same record, with the stricter interval:
+
+```
+THE SHORT ANSWER
+  Cassandra cannot yet be told apart from the base-rate forecaster: any edge she has is
+  within the range that luck alone could produce.
+  Skill score +0.03 over 107 comparable predictions (90% interval -0.01 to +0.07). 0 means
+  no better than the base rate, 1 would be perfect, below 0 is worse.
+```
+
+The 107 comparable predictions were made on 12 days about only 9 stories. Resampling by story is what widened the interval. Everything else in the report is unchanged from 2.3.
+
+The full `--report` output under 2.3, which resampled only by day and so called the same figures a win: 170 predictions graded between 6 and 21 November 2026, on the default BBC and Guardian feeds.
 
 ```
 Data: cassandra-data. 217 predictions logged: 170 graded, 47 pending, 0 void (could not be
@@ -102,7 +114,7 @@ BRIER SCORE BY WEEK (week starting, by date graded)
 
 How to read it:
 
-- **She beats the base rate, narrowly** (skill +0.03, interval +0.01 to +0.05). The interval resamples whole days but not runs of days about the same story, so the true uncertainty is somewhat wider and the lower end could reach zero. Treat this as an early, encouraging sign rather than settled.
+- **Ahead of the base rate, but not clearly** (skill +0.03). Under 2.3 the interval was +0.01 to +0.05, a win. Resampling by story as well (2.4) widens it to −0.01 to +0.07, because 107 predictions about 9 stories hold far less independent evidence than their number suggests. That's an early, encouraging sign, not a result.
 - **The gain comes from `TOP5`.** Both horizons beat the base rate, and the 7-day one by most (+0.13, but on only 14 comparable predictions). Her average `TOP5` forecasts (70% and 61%) sit below how often those claims came true (78% and 76%), so she's still too cautious about leading stories lasting.
 - **`SHARE_UP` is level with the base rate** (−0.01). Whether a story will grow over three days remains her hardest call, as it was on demo data.
 - **The evidence is earning its say on three of four types.** For `TOP5@7` it has scored worse than her starting point (the base rate blended with her first guess), so its weight is currently 0%. See [step 5 of How a run works](#how-a-run-works).
@@ -348,6 +360,7 @@ Everything else lives in `Cassandra.java`:
 | The evidence each prediction type uses | `makePredictions` |
 | Comparable predictions needed before `--report` gives a verdict | `MIN_FOR_VERDICT` |
 | Bootstrap resamples for the skill-score interval | `BOOTSTRAP` |
+| Stories needed before the by-story interval is reported as reliable | `MIN_STORIES` |
 | Comparable predictions before a type's skill is coloured in the window | `Gui.MIN_TYPE_SKILL` |
 | The desktop window, its tabs and charts | the `Gui` class at the end of the file |
 | Stopwords, sentiment and domain vocabularies | `STOP`, `NEG`, `POS`, `LEX` |
@@ -549,13 +562,14 @@ Cassandra predicts news *coverage*. If she ever became widely read, her forecast
 java Cassandra --selftest
 ```
 
-Runs Cassandra's built-in checks and prints one line per check, ending with `All 22 checks passed`. It works offline, in a temporary folder that is removed afterwards, with the default settings, so it never touches your data and gives the same answer on any machine. The exit status is 0 if every check passes and 1 otherwise, so a script can stop before doing anything with a broken build (the [publish script](#putting-it-online) does exactly that).
+Runs Cassandra's built-in checks and prints one line per check, ending with `All 23 checks passed`. It works offline, in a temporary folder that is removed afterwards, with the default settings, so it never touches your data and gives the same answer on any machine. The exit status is 0 if every check passes and 1 otherwise, so a script can stop before doing anything with a broken build (the [publish script](#putting-it-online) does exactly that).
 
 | Check | What it guards |
 |---|---|
 | Brier score | The scoring formula, and the 0.25 a coin flip should get |
 | Base-rate forecaster only uses results known at the time | The benchmark can't flatter itself with hindsight |
 | Accuracy verdicts | A well-informed forecaster is judged "beating", a backwards one "worse", 20 results "too early"; the skill score sits inside its interval |
+| The interval allows for stories predicted on several days | Six stories predicted on eight days each give a much wider interval by story than by day, the wider range is the one used, and six stories aren't enough to call her a winner |
 | Recalibration | No change on too few results; overconfidence pulled down, underconfidence pushed up |
 | Trend fit | Slope and fitted value of an exact line, the spread's floor, no trend from two days |
 | Trend starts on the day a story first appeared | Earlier days don't count as zero coverage |
@@ -583,7 +597,7 @@ It does not test the desktop window (that needs a screen) or fetch live feeds. T
 - **It cannot foresee events.** The predictions are about news coverage (what will be in the headlines, how big it will be, what tone it will have), not about the underlying events. The narrative is template-based and will sound plausible whatever the facts. Do not use any of it for financial, political or safety decisions.
 - **The live record is short.** Her edge over the base rate rests on two and a half weeks of grades (see [Live track record](#live-track-record)), and a small edge on a short record can shrink or vanish.
 - **Early probabilities are guesses.** With few graded results her probabilities lean on hand-set first guesses, and with only a handful of results both her probabilities and the track record are statistically noisy.
-- **The interval is approximate.** Resampling by day allows for predictions on the same day being linked, but not for links across days (the same story is predicted about on several days running), so the true uncertainty is somewhat wider.
+- **The interval is approximate.** Resampling by day and by story allows for the two main ways predictions are linked, but not for both at once, nor for links between stories (a big news day can push several stories out of the top 5). With few stories, the by-story range is unreliable.
 - **Evidence learns slowly.** Evidence gets no say until her record shows it helps, and a group with few results stays near its parent's rate, so real effects take weeks to show. On the live record so far, the evidence has earned no say at all for `TOP5@7`.
 - **A cold start takes time.** No trend appears until three different days have been recorded, the first grades arrive three days after the first run, and a verdict needs a few weeks.
 - **Story identity can drift.** A story is tracked by its top-ranked term; if the leading word changes from day to day, history for that story may be split, and it may be treated as new.
@@ -624,6 +638,12 @@ Issues and pull requests are welcome. If you change priors, lexicons or template
 ## Version history
 
 Versions 2.1 to 2.3 are summarised from the code. Each change that affects predictions is recorded with the predictions it applies to, so older predictions keep being graded and reported under the rules they were made with.
+
+### Version 2.4: a stricter margin of error
+
+- **The skill score's interval now allows for stories as well as days.** Until 2.4 only whole days were resampled, which allowed for predictions made on the same day being linked, but not for the same story being predicted about on several days running. The interval is now worked out both ways, and the verdict uses the wider range. The report shows both, and warns when there are too few stories (under 10) for even the wider range to be trusted.
+- **No change to predictions.** Forecasts, grading and saved files are exactly as in 2.3, so the live record carries on unbroken. Only how sure the report is about the score has changed.
+- **Self-test:** 23 checks. The new one fails if the by-story interval is dropped.
 
 ### Version 2.3: the evidence has to earn its say
 

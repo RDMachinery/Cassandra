@@ -1200,6 +1200,7 @@ public class Cassandra {
     static final int BOOTSTRAP = 2000;     // resamples for the skill-score interval
     static final int BASE_WARMUP = 5;      // earlier results of a type the base-rate forecaster needs
     static final int MIN_FOR_VERDICT = 30; // comparable predictions needed before --report gives a verdict
+    static final int MIN_STORIES = 10;     // stories needed before resampling by story is worth reporting
 
     static double outcome(Pred p) { return p.outcome().equals("TRUE") ? 1 : 0; }
 
@@ -1236,19 +1237,24 @@ public class Cassandra {
     }
 
     /**
-     * 90% bootstrap interval for the skill score 1 - B(Cassandra) / B(base rate).
-     * Whole days are resampled rather than single predictions: predictions made on the same day are
-     * about the same stories and tend to succeed or fail together, and treating them as independent
-     * would make the interval look narrower than it really is.
+     * 90% bootstrap interval for the skill score 1 - B(Cassandra) / B(base rate), resampling whole groups of
+     * predictions rather than single ones. Predictions that tend to succeed or fail together must be resampled
+     * together, or the interval looks narrower than it really is. Two kinds of link matter:
+     *  - by day: predictions made on the same day are about the same day's news;
+     *  - by story: the same story is predicted about on several days running (term is its tracked key).
+     * skillIntervals() computes both, and the verdict uses the wider range (the lower of the two lower ends and
+     * the higher of the two upper ends), so neither kind of link can make her look better than she is.
+     * (Until 2.4 only days were resampled.)
      */
-    static double[] skillInterval(List<Pred> graded, Map<String, Double> base) {
-        Map<LocalDate, double[]> byDay = new TreeMap<>(); // made date -> {sum Brier Cassandra, sum Brier base}
-        for (Pred p : graded) {
-            double[] s = byDay.computeIfAbsent(p.made(), k -> new double[2]);
+    static double[] skillInterval(List<Pred> graded, Map<String, Double> base,
+                                  java.util.function.Function<Pred, Object> group) {
+        Map<Object, double[]> byGroup = new TreeMap<>(Comparator.comparing(Object::toString));
+        for (Pred p : graded) {   // group -> {sum Brier Cassandra, sum Brier base}
+            double[] s = byGroup.computeIfAbsent(group.apply(p), k -> new double[2]);
             s[0] += Math.pow(p.p() - outcome(p), 2);
             s[1] += Math.pow(base.get(p.id()) - outcome(p), 2);
         }
-        List<double[]> days = new ArrayList<>(byDay.values());
+        List<double[]> days = new ArrayList<>(byGroup.values());
         int n = days.size();
         Random rnd = new Random(42);
         double[] skills = new double[BOOTSTRAP];
@@ -1259,6 +1265,13 @@ public class Cassandra {
         }
         Arrays.sort(skills);
         return new double[]{skills[(int) (0.05 * BOOTSTRAP)], skills[(int) (0.95 * BOOTSTRAP) - 1]};
+    }
+
+    /** The two intervals and the range used: {by day, by story, wider of the two}. */
+    static double[][] skillIntervals(List<Pred> graded, Map<String, Double> base) {
+        double[] day = skillInterval(graded, base, Pred::made);
+        double[] story = skillInterval(graded, base, Pred::term);
+        return new double[][]{day, story, {Math.min(day[0], story[0]), Math.max(day[1], story[1])}};
     }
 
     static String num(double v, String fmt) { return Double.isNaN(v) ? "n/a" : String.format(Locale.ROOT, fmt, v); }
@@ -1292,7 +1305,8 @@ public class Cassandra {
      */
     record Accuracy(Path dir, int logged, int pending, int voided, List<Pred> graded, List<Pred> comparable,
                     double bCass, double bRaw, double bCoin, double cCass, double cBase, double skill, double[] ci,
-                    Verdict verdict, int recalibrated, List<TypeRow> types, List<Bin> bins, List<WeekRow> weeks) {}
+                    Verdict verdict, int recalibrated, List<TypeRow> types, List<Bin> bins, List<WeekRow> weeks,
+                    double[] ciDay, double[] ciStory, int days, int stories) {}
 
     /** Load and score a data directory's predictions, or return null if it has none. */
     static Accuracy loadAccuracy(Path dir) {
@@ -1313,10 +1327,15 @@ public class Cassandra {
         double cCass = brier(comp, Pred::p), cBase = brier(comp, baseOf);
         double skill = comp.isEmpty() || cBase == 0 ? Double.NaN : 1 - cCass / cBase;
 
-        double[] ci = null;
+        double[] ci = null, ciDay = null, ciStory = null;
+        int nDays = (int) comp.stream().map(Pred::made).distinct().count();
+        int nStories = (int) comp.stream().map(Pred::term).distinct().count();
         Verdict verdict = Verdict.TOO_EARLY;
         if (comp.size() >= MIN_FOR_VERDICT) {
-            ci = skillInterval(comp, base);
+            double[][] cis = skillIntervals(comp, base);
+            ciDay = cis[0];
+            ciStory = cis[1];
+            ci = cis[2];
             verdict = ci[0] > 0 ? Verdict.BEATING : ci[1] < 0 ? Verdict.WORSE : Verdict.UNCLEAR;
         }
         int recal = (int) graded.stream().filter(p -> Math.abs(p.p() - p.pRaw()) > 1e-9).count();
@@ -1355,7 +1374,7 @@ public class Cassandra {
                     cs.size(), brier(cs, Pred::p), brier(cs, Pred::pRaw), brier(cs, baseOf)));
         }
         return new Accuracy(dir, preds.size(), pending, voided, graded, comp, bCass, bRaw, bCoin, cCass, cBase,
-                skill, ci, verdict, recal, types, bins, weeks);
+                skill, ci, verdict, recal, types, bins, weeks, ciDay, ciStory, nDays, nStories);
     }
 
     static void accuracyReport(Path dir) {
@@ -1436,6 +1455,17 @@ public class Cassandra {
             System.out.println(wrap(String.format(Locale.ROOT, "Skill score %s over %d comparable predictions "
                     + "(90%% interval %+.2f to %+.2f). 0 means no better than the base rate, 1 would be perfect, "
                     + "below 0 is worse.", num(a.skill(), "%+.2f"), nComp, a.ci()[0], a.ci()[1]), "  "));
+            System.out.println(wrap(a.stories() < MIN_STORIES
+                    ? String.format(Locale.ROOT, "The interval allows for predictions that succeed or fail together. "
+                    + "Resampling the %d days she made them on gives %+.2f to %+.2f; resampling the %d stories they "
+                    + "were about gives %+.2f to %+.2f. The wider range is used, but with so few stories even that "
+                    + "is rough: the true uncertainty may be wider still.", a.days(), a.ciDay()[0], a.ciDay()[1],
+                    a.stories(), a.ciStory()[0], a.ciStory()[1])
+                    : String.format(Locale.ROOT, "The interval allows for predictions that succeed or "
+                    + "fail together. Resampling the %d days she made them on gives %+.2f to %+.2f; resampling the "
+                    + "%d stories they were about (each predicted on several days) gives %+.2f to %+.2f. The wider "
+                    + "range is used.", a.days(), a.ciDay()[0], a.ciDay()[1], a.stories(), a.ciStory()[0],
+                    a.ciStory()[1]), "  "));
         }
 
         // ---- scores against benchmarks
@@ -2231,6 +2261,29 @@ public class Cassandra {
             expect(computeAccuracy(good.subList(0, 20), tmp).verdict() == Verdict.TOO_EARLY, "20 results: too early");
             Accuracy a = computeAccuracy(good, tmp);
             expect(a.ci()[0] <= a.skill() && a.skill() <= a.ci()[1], "the skill score lies inside its interval");
+        });
+
+        checks.put("The interval allows for stories predicted on several days", () -> {
+            // Six stories, each the only one predicted about for eight days running. Within a story every
+            // prediction succeeds or fails together, so 48 days of predictions carry only six stories' worth
+            // of evidence: resampling days alone would overstate how sure we can be.
+            List<Pred> ps = new ArrayList<>();
+            for (int s = 0; s < 6; s++)
+                for (int i = 0; i < 8; i++) {
+                    LocalDate made = d0.plusDays(s * 8 + i);
+                    double p = s % 3 == 2 ? 0.2 : 0.8;   // right about four stories, wrong about two
+                    String o = (s % 2 == 0) ? "TRUE" : "FALSE";
+                    if (o.equals("FALSE")) p = 1 - p;
+                    ps.add(new Pred("s" + s + "-" + i, made, made.plusDays(3), "story" + s, "story" + s, "TOP5", "-",
+                            p, p, o, made.plusDays(3).toString(), ""));
+                }
+            Accuracy a = computeAccuracy(ps, tmp);
+            expect(a.stories() == 6 && a.days() > 30, "days and stories are counted");
+            double byDay = a.ciDay()[1] - a.ciDay()[0], byStory = a.ciStory()[1] - a.ciStory()[0];
+            expect(byStory > 1.5 * byDay, "resampling by story gives the wider interval here");
+            near(a.ci()[0], Math.min(a.ciDay()[0], a.ciStory()[0]), "the lower end is the lower of the two");
+            near(a.ci()[1], Math.max(a.ciDay()[1], a.ciStory()[1]), "the upper end is the higher of the two");
+            expect(a.verdict() != Verdict.BEATING, "six stories are not enough to call her a winner");
         });
 
         checks.put("Recalibration", () -> {
@@ -4847,7 +4900,7 @@ public class Cassandra {
             }
         }
 
-        static final String VERSION = "2.3";
+        static final String VERSION = "2.4";
         static final String REPO = REPO_URL;
 
         void showAbout() {
